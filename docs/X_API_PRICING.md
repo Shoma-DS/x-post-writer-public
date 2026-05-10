@@ -39,7 +39,7 @@
 
 ---
 
-## team-info の現在のAPI使用コスト試算
+## ローカル運用時のAPI使用コスト試算
 
 ### x_metrics_collector.py（毎時5分に自動実行）
 

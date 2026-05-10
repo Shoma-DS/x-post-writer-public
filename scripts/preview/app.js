@@ -83,9 +83,10 @@ const groupCollapsed = { draft: false, published: true };
 // 一覧ページング
 const DRAFT_PAGE_SIZE = 20;
 
-// 文字数制限
-const CHAR_LIMIT = 25000;
-const CHAR_WARN  = 280;
+// 文字数チェックは課金/非課金アカウントに合わせて切り替える。
+const CHAR_LIMIT = 280;
+const CHAR_CHECK_KEY = 'x-preview-char-count-check-enabled';
+let charCountCheckEnabled = localStorage.getItem(CHAR_CHECK_KEY) === '1';
 
 // ── 初期化 ──────────────────────────────────────────
 
@@ -319,6 +320,7 @@ function renderDraftList() {
     const obsidianBadge = d.obsidian_save?.saved
       ? `<span class="badge badge-obsidian">Obsidian保存済み</span>`
       : '';
+    const qualityBadge = renderQualityBadge(assessDraftQuality(d));
     return `
       <div class="draft-item${isPosted ? ' posted' : ''}" data-id="${d.draft_id}"
            onclick="selectDraft('${d.draft_id}')">
@@ -331,6 +333,7 @@ function renderDraftList() {
         </div>
         <div class="draft-item-preview">${esc(preview)}${preview.length >= 48 ? '…' : ''}</div>
         <div class="draft-item-meta">
+          ${qualityBadge}
           ${threadBadge}
           ${imageBadge}
           ${obsidianBadge}
@@ -385,6 +388,163 @@ function renderDraftList() {
       el.classList.toggle('active', el.dataset.id === currentDraft.draft_id)
     );
   }
+}
+
+// ── 投稿前品質チェック ───────────────────────────────
+
+function getDraftPartsForQuality(draft) {
+  if (Array.isArray(draft?.parts) && draft.parts.length > 0) {
+    return draft.parts.map((part, index) => ({
+      position: Number(part.position || index + 1),
+      content: String(part.content || ''),
+      image_url: part.image_url || '',
+    }));
+  }
+  const preview = String(draft?.preview_content || '').trim();
+  return preview ? [{ position: 1, content: preview, image_url: draft?.has_image ? 'attached' : '' }] : [];
+}
+
+function hasImagePromptForQuality(draft) {
+  return Array.isArray(draft?.image_prompts)
+    && draft.image_prompts.some(prompt => String(prompt?.prompt || '').trim());
+}
+
+function repeatedTextSignals(parts) {
+  const chunks = [];
+  for (const part of parts) {
+    const normalized = part.content
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[！？!?。．\n]/g, '。')
+      .split('。')
+      .map(value => value.trim())
+      .filter(value => value.length >= 10);
+    chunks.push(...normalized);
+  }
+  const seen = new Set();
+  const repeated = new Set();
+  for (const chunk of chunks) {
+    const key = chunk.replace(/\s+/g, '').toLowerCase();
+    if (seen.has(key)) repeated.add(chunk);
+    seen.add(key);
+  }
+  return [...repeated].slice(0, 3);
+}
+
+function assessDraftQuality(draft) {
+  const parts = getDraftPartsForQuality(draft);
+  const checks = [];
+  const hasImage = !!draft?.has_image || parts.some(part => !!part.image_url);
+  const hasImagePrompt = hasImagePromptForQuality(draft);
+  const original = draft?.original_tweet || {};
+  const isThread = parts.length > 1 || Number(draft?.part_count || 0) > 1;
+  const firstText = String(parts[0]?.content || '').trim();
+  const fullText = parts.map(part => part.content).join('\n');
+
+  const emptyParts = parts.filter(part => !part.content.trim());
+  if (parts.length === 0 || emptyParts.length > 0) {
+    checks.push({ level: 'danger', label: '空本文', detail: '本文が空のパーツがあります' });
+  } else {
+    checks.push({ level: 'ok', label: '本文', detail: `${parts.length}パーツ` });
+  }
+
+  if (charCountCheckEnabled) {
+    const overLimitParts = parts.filter(part => [...part.content].length > CHAR_LIMIT);
+    if (overLimitParts.length > 0) {
+      checks.push({ level: 'danger', label: '文字数', detail: `${CHAR_LIMIT}字超え: ${overLimitParts.map(part => part.position).join(', ')}` });
+    } else {
+      checks.push({ level: 'ok', label: '文字数', detail: `${CHAR_LIMIT}字以内` });
+    }
+  }
+
+  if (hasImage) {
+    checks.push({ level: 'ok', label: '画像', detail: '設定済み' });
+  } else if (hasImagePrompt) {
+    checks.push({ level: 'warn', label: '画像', detail: 'プロンプトあり・画像未設定' });
+  } else {
+    checks.push({ level: 'info', label: '画像', detail: '画像なし' });
+  }
+
+  if (isThread) {
+    const veryShort = parts.filter(part => part.content.trim() && [...part.content.trim()].length < 18);
+    if (veryShort.length > 0) {
+      checks.push({ level: 'warn', label: 'ツリー', detail: `短すぎるパーツ: ${veryShort.map(part => part.position).join(', ')}` });
+    } else {
+      checks.push({ level: 'ok', label: 'ツリー', detail: `${parts.length || draft.part_count}パーツ` });
+    }
+  } else {
+    checks.push({ level: 'ok', label: '形式', detail: '単発' });
+  }
+
+  if (original && Object.keys(original).length > 0) {
+    if (original.tweet_url) {
+      checks.push({ level: 'ok', label: '引用元', detail: 'URLあり' });
+    } else {
+      checks.push({ level: 'warn', label: '引用元', detail: '元投稿URLなし' });
+    }
+  }
+
+  const repeated = repeatedTextSignals(parts);
+  if (repeated.length > 0) {
+    checks.push({ level: 'warn', label: '重複', detail: repeated[0] });
+  } else if (parts.length > 0) {
+    checks.push({ level: 'ok', label: '重複', detail: '目立つ重複なし' });
+  }
+
+  if (firstText && [...firstText].length < 18 && !/[？?！!]/.test(firstText)) {
+    checks.push({ level: 'warn', label: 'フック', detail: '冒頭が弱い可能性' });
+  }
+  if (fullText && !/(https?:\/\/|詳しく|保存|試して|見て|チェック|どう思|ください|👇|↓)/.test(fullText)) {
+    checks.push({ level: 'info', label: 'CTA', detail: '明確な誘導なし' });
+  }
+
+  const dangerCount = checks.filter(check => check.level === 'danger').length;
+  const warnCount = checks.filter(check => check.level === 'warn').length;
+  const infoCount = checks.filter(check => check.level === 'info').length;
+  const score = Math.max(0, 100 - dangerCount * 35 - warnCount * 14 - infoCount * 4);
+  const level = dangerCount > 0 || score < 60 ? 'danger' : warnCount > 0 || score < 82 ? 'warn' : 'ok';
+  const label = level === 'danger' ? '危険' : level === 'warn' ? '要修正' : 'OK';
+  return { level, label, score, checks };
+}
+
+function renderQualityBadge(quality) {
+  const className = `badge-quality badge-quality-${quality.level}`;
+  return `<span class="badge ${className}" title="品質スコア ${quality.score}">${quality.label} ${quality.score}</span>`;
+}
+
+function renderQualityPanel(draft) {
+  const quality = assessDraftQuality(draft);
+  const charToggleLabel = charCountCheckEnabled ? '文字数チェック ON' : '文字数チェック OFF';
+  const items = quality.checks.map(check => `
+    <div class="quality-check quality-check-${check.level}">
+      <span class="quality-check-icon">${qualityIcon(check.level)}</span>
+      <span class="quality-check-label">${esc(check.label)}</span>
+      <span class="quality-check-detail">${esc(check.detail)}</span>
+    </div>`).join('');
+  return `
+    <section class="quality-panel quality-panel-${quality.level}" aria-label="投稿前チェック">
+      <div class="quality-panel-head">
+        <span class="quality-title">${materialIcon('fact_check', { filled: true })}投稿前チェック</span>
+        <span class="quality-panel-actions">
+          <button class="quality-toggle-btn ${charCountCheckEnabled ? 'active' : ''}" onclick="toggleCharCountCheck()">${esc(charToggleLabel)}</button>
+          <span class="quality-score">${esc(quality.label)} ${quality.score}</span>
+        </span>
+      </div>
+      <div class="quality-check-grid">${items}</div>
+    </section>`;
+}
+
+function toggleCharCountCheck() {
+  charCountCheckEnabled = !charCountCheckEnabled;
+  localStorage.setItem(CHAR_CHECK_KEY, charCountCheckEnabled ? '1' : '0');
+  renderDraftList();
+  if (currentDraft) renderPreview(currentDraft);
+}
+
+function qualityIcon(level) {
+  if (level === 'danger') return materialIcon('error', { filled: true });
+  if (level === 'warn') return materialIcon('warning', { filled: true });
+  if (level === 'ok') return materialIcon('check_circle', { filled: true });
+  return materialIcon('info', { filled: true });
 }
 
 function toggleGroup(key) {
@@ -710,6 +870,7 @@ function renderPreview(draft) {
       </div>
     </div>
     ${postedBar}
+    ${renderQualityPanel(draft)}
     <div class="preview-url-bar">
       ${materialIcon('link')}<a href="${previewUrl}" target="_blank">${previewUrl}</a>
     </div>
@@ -826,10 +987,10 @@ function buildDraftCards(draft, isThread) {
   const cards = draft.parts.map((part, i) => {
     const isLast  = i === draft.parts.length - 1;
     const charLen = [...part.content].length;
-    let charClass = 'char-ok';
-    if (charLen > CHAR_LIMIT) charClass = 'char-over';
-    else if (charLen > CHAR_WARN) charClass = 'char-warn';
-    const charLabel = charLen > CHAR_LIMIT ? ` ${materialIcon('warning', { filled: true })}上限超過` : charLen > CHAR_WARN ? ' (長文)' : '';
+    const charClass = charCountCheckEnabled && charLen > CHAR_LIMIT ? 'char-over' : 'char-ok';
+    const charLabel = charCountCheckEnabled && charLen > CHAR_LIMIT
+      ? ` ${materialIcon('warning', { filled: true })}${CHAR_LIMIT}字超過`
+      : '';
 
     const avatarEl = renderIdentityAvatar(identity, 'avatar');
     const avatarBlock = isThread && !isLast
@@ -1041,6 +1202,7 @@ function hasLogoDetection(draftId) {
 }
 
 function logoPreviewUrl(candidate) {
+  if (candidate.preview_url) return candidate.preview_url;
   if (candidate.image_path && /\.(png|jpe?g|webp|gif|svg|ico)$/i.test(candidate.image_path)) {
     return `${window.location.origin}/local-image?path=${encodeURIComponent(candidate.image_path)}`;
   }
@@ -3716,7 +3878,13 @@ function esc(str) {
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-function escAttr(str) { return String(str ?? '').replace(/"/g,'&quot;'); }
+function escAttr(str) {
+  return String(str ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/"/g,'&quot;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
 
 function normalizeXProfileImageUrl(url) {
   return String(url || '').replace('_normal.', '_400x400.');

@@ -36,7 +36,7 @@ BOOKMARKS_FILE = SCRIPT_DIR / "bookmarks_latest.json"
 CONFIG_FILE = SCRIPT_DIR / "accounts_config.json"
 SCHEMA_FILE = SCRIPT_DIR / "draft_generation_schema.json"
 CLAUDE_SETTINGS_FILE = REPO_ROOT / ".claude" / "settings.local.json"
-DEFAULT_PREVIEW_URL = "https://zinciferous-preludiously-draven.ngrok-free.dev"
+DEFAULT_PREVIEW_URL = os.environ.get("X_PUBLIC_URL", "http://localhost:8765")
 DISCORD_WEBHOOK_ENV = "DISCORD_WEBHOOK_X_DRAFT"
 TOKEN_LIMIT_PATTERNS = (
     r"token limit",

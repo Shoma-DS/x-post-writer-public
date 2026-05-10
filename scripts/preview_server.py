@@ -7,12 +7,14 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import mimetypes
 import os
 import queue
 import re
 import secrets
 import shlex
+import socket
 import select
 import shutil
 import subprocess
@@ -22,7 +24,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote as urlquote, urlencode, unquote, urljoin
 from http.cookies import SimpleCookie
@@ -42,6 +44,7 @@ PORT = 8765
 PREVIEW_DIR   = Path(__file__).parent / "preview"
 BOOKMARKS_FILE = Path(__file__).parent / "bookmarks_latest.json"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = REPO_ROOT.parents[1]
 ENV_PATH = REPO_ROOT / ".env"
 ACCOUNTS_CONFIG_PATH = Path(__file__).parent / "accounts_config.json"
 ACCOUNT_INFO_DIR = Path(__file__).parent.parent / "accounts"
@@ -92,7 +95,12 @@ load_repo_env()
 PUBLIC_URL = os.environ.get("LT_PUBLIC_URL", f"http://localhost:{PORT}")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_X_DRAFT", "")
 LOCAL_IMAGE_ROOTS = [
-    Path(os.environ.get("X_POST_WRITER_ROOT", Path.cwd())) / "personal",
+    WORKSPACE_ROOT / "runtime",
+    WORKSPACE_ROOT / "public",
+    REPO_ROOT / "runtime",
+    Path(os.environ.get("X_POST_WRITER_ROOT", WORKSPACE_ROOT)) / "runtime",
+    Path(os.environ.get("X_POST_RUNTIME_ROOT", str(WORKSPACE_ROOT / "runtime"))),
+    Path.home() / ".config" / "x-post-writer",
     Path.home() / ".codex" / "generated_images",
 ]
 OBSIDIAN_VAULT_ENV_KEYS = ("X_POST_OBSIDIAN_VAULT", "OBSIDIAN_VAULT_PATH")
@@ -109,7 +117,7 @@ _auto_post_jobs: dict[str, dict] = {}
 
 
 def image_generation_output_dir() -> Path:
-    return Path(os.environ.get("X_POST_WRITER_ROOT", REPO_ROOT)) / "outputs" / "x-post-images"
+    return Path(os.environ.get("X_POST_RUNTIME_ROOT", str(WORKSPACE_ROOT / "runtime"))) / "x-post-images"
 
 
 def current_dev_mode_label() -> str:
@@ -452,7 +460,7 @@ def fetch_drafts(account: str = "", *, limit: int = 20, offset: int = 0, query: 
                     "draft_id": draft_id,
                     "x_username": draft["x_username"],
                     "display_name": draft["display_name"] or draft["x_username"],
-                    "profile_image_url": draft["profile_image_url"] or "",
+                    "profile_image_url": normalize_image_url(draft["profile_image_url"]),
                     "memo": draft["memo"] or "",
                     "status": draft["status"] or "draft",
                     "has_image": bool(draft["has_image"]),
@@ -498,7 +506,7 @@ def fetch_accounts() -> list[dict]:
             "id": account_id,
             "x_username": username,
             "display_name": item.get("display_name") or username or account_id,
-            "profile_image_url": item.get("profile_image_url") or "",
+            "profile_image_url": normalize_image_url(item.get("profile_image_url") or ""),
             "token_env": item.get("token_env") or "",
             "token_secret_env": item.get("token_secret_env") or "",
             "draft_count": 0,
@@ -529,7 +537,7 @@ def fetch_accounts() -> list[dict]:
                     "id": preset.get("id") or str(row["account_id"]),
                     "x_username": username,
                     "display_name": row["display_name"] or username,
-                    "profile_image_url": row["profile_image_url"] or preset.get("profile_image_url") or "",
+                    "profile_image_url": normalize_image_url(row["profile_image_url"] or preset.get("profile_image_url") or ""),
                     "draft_count": int(row["draft_count"] or 0),
                     "token_env": preset.get("token_env") or "",
                     "token_secret_env": preset.get("token_secret_env") or "",
@@ -634,7 +642,7 @@ def fetch_draft(draft_id):
                 "draft_id": str(draft["draft_id"]),
                 "x_username": draft["x_username"],
                 "display_name": draft["display_name"] or draft["x_username"],
-                "profile_image_url": draft["profile_image_url"] or "",
+                "profile_image_url": normalize_image_url(draft["profile_image_url"]),
                 "memo": draft["memo"] or "",
                 "status": draft["status"] or "draft",
                 "has_image": has_image,
@@ -645,7 +653,7 @@ def fetch_draft(draft_id):
                         "part_id": str(p["part_id"]),
                         "position": p["position"],
                         "content": p["content"],
-                        "image_url": p["image_url"],
+                        "image_url": normalize_draft_image_url(p["image_url"]),
                     }
                     for p in parts
                 ],
@@ -796,7 +804,7 @@ def _git_account_slug() -> str:
         accounts = [p.name for p in personal_root.iterdir() if p.is_dir()]
         if len(accounts) == 1:
             return accounts[0]
-    return "deguchishouma"
+    return "default"
 
 
 def get_obsidian_vault_path() -> Path:
@@ -812,7 +820,6 @@ def get_obsidian_vault_path() -> Path:
     personal_root = REPO_ROOT / "personal"
     candidates: list[Path] = [
         personal_root / _git_account_slug() / "obsidian" / "claude-obsidian",
-        personal_root / "deguchishouma" / "obsidian" / "claude-obsidian",
     ]
     if personal_root.exists():
         candidates.extend(
@@ -2020,7 +2027,7 @@ def run_codex_app_server_turn(
             {
                 "clientInfo": {
                     "name": "team_info_x_post_preview",
-                    "title": "X Post Writer Preview",
+                    "title": "X運用 Preview",
                     "version": "0.1.0",
                 }
             },
@@ -2158,7 +2165,7 @@ def attach_generated_image(draft_id: str, image_path_text: str) -> str:
     image_path = resolve_local_image(image_path_text)
     if not image_path:
         raise ValueError("画像が見つからないか、許可されていないパスです")
-    image_url = f"/local-image?path={str(image_path)}"
+    image_url = local_image_url(image_path)
     if not update_draft_image(draft_id, 1, image_url):
         raise ValueError("画像を添付する投稿パーツが見つかりません")
     return image_url
@@ -2290,7 +2297,25 @@ def load_logo_presets(user_id: str | None = None) -> list[dict]:
         items = payload.get("logos") if isinstance(payload, dict) else payload
         if isinstance(items, list):
             presets.extend(item for item in items if isinstance(item, dict))
-    return presets
+    return [normalize_logo_image_fields(preset) for preset in presets]
+
+
+def normalize_logo_image_fields(logo: dict) -> dict:
+    normalized = dict(logo)
+    image_path = str(normalized.get("image_path") or "").strip()
+    if image_path:
+        path = normalize_local_image_path_text(image_path)
+        if not path.is_absolute():
+            path = (LOGO_PRESETS_PATH.parent / path).resolve()
+        normalized["image_path"] = str(path)
+        local_path = resolve_local_image(str(path)) or resolve_any_local_image(str(path))
+        if local_path:
+            normalized["preview_url"] = local_image_url(local_path)
+            return normalized
+
+    image_url = str(normalized.get("image_url") or "").strip()
+    normalized["preview_url"] = normalize_image_url(image_url) if image_url else ""
+    return normalized
 
 
 def _normalize_logo_text(text: str) -> str:
@@ -2349,6 +2374,7 @@ def extract_logo_candidate_names(*texts: str, user_id: str | None = None) -> lis
                 "registered": True,
                 "image_url": logo.get("image_url") or "",
                 "image_path": logo.get("image_path") or "",
+                "preview_url": logo.get("preview_url") or "",
                 "source_url": logo.get("source_url") or "",
                 "matched_aliases": logo.get("matched_aliases") or [],
                 "reason": "登録済み辞書に一致",
@@ -2372,6 +2398,7 @@ def extract_logo_candidate_names(*texts: str, user_id: str | None = None) -> lis
                 "registered": bool(registered),
                 "image_url": (registered or {}).get("image_url") or "",
                 "image_path": (registered or {}).get("image_path") or "",
+                "preview_url": (registered or {}).get("preview_url") or "",
                 "source_url": f"{parsed.scheme}://{parsed.netloc}",
                 "matched_aliases": [host],
                 "reason": "本文・プロンプト内URLのドメイン",
@@ -2399,6 +2426,7 @@ def extract_logo_candidate_names(*texts: str, user_id: str | None = None) -> lis
                 "registered": bool(registered),
                 "image_url": (registered or {}).get("image_url") or "",
                 "image_path": (registered or {}).get("image_path") or "",
+                "preview_url": (registered or {}).get("preview_url") or "",
                 "source_url": (registered or {}).get("source_url") or "",
                 "matched_aliases": [raw],
                 "reason": "本文・画像プロンプト内のサービス名らしい英字表記",
@@ -2540,7 +2568,7 @@ def save_uploaded_reference_image(filename: str, content_type: str, body: bytes)
     dest.write_bytes(body)
     return {
         "local_path": str(dest),
-        "url": f"/local-image?path={str(dest)}",
+        "url": local_image_url(dest),
     }
 
 
@@ -4276,7 +4304,7 @@ def run_playwright_auto_post(job: dict, draft: dict, parts: list[str], image_url
         "parts": parts,
         "image_path": image_path,
         "dry_run": os.environ.get("X_AUTO_POST_DRY_RUN", "").strip().lower() in {"1", "true", "yes"},
-        "profile_dir": os.environ.get("X_PLAYWRIGHT_PROFILE_DIR", str(Path.home() / ".x-post-writer-playwright" / "x-profile")),
+        "profile_dir": os.environ.get("X_PLAYWRIGHT_PROFILE_DIR", str(Path.home() / "Desktop" / "X運用" / "runtime" / "playwright-x-profile")),
         "screenshot_dir": str(screenshot_dir),
     }
 
@@ -4638,6 +4666,58 @@ def resolve_local_image(path_text: str) -> Path | None:
     return None
 
 
+def local_image_url(path: Path) -> str:
+    return f"/local-image?path={urlquote(str(path), safe='')}"
+
+
+def remote_image_url(url: str) -> str:
+    return f"/remote-image?url={urlquote(str(url), safe='')}"
+
+
+def is_safe_remote_image_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    host = parsed.hostname or ""
+    if host in {"localhost"} or host.endswith(".local"):
+        return False
+    try:
+        addresses = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False
+    for family, _, _, _, sockaddr in addresses:
+        address = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            return False
+    return True
+
+
+def normalize_image_url(image_url: str) -> str:
+    raw = str(image_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme in {"data", "blob"}:
+        return raw
+    if parsed.scheme in {"http", "https"}:
+        if parsed.path == "/local-image":
+            return raw
+        return remote_image_url(raw)
+    local_path = resolve_local_image(raw)
+    if local_path:
+        return local_image_url(local_path)
+    return raw
+
+
+def normalize_draft_image_url(image_url: str) -> str:
+    """DBに絶対パスが残っていても、ブラウザで表示できるURLへ寄せる。"""
+    return normalize_image_url(image_url)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -4937,6 +5017,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             content_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
             self.send_file(image_path, content_type)
+        elif path == "/remote-image":
+            image_url = qs.get("url", [""])[0]
+            if not is_safe_remote_image_url(image_url):
+                self.send_json({"error": "許可されていない画像URLです"}, 400)
+                return
+            try:
+                req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    body = resp.read(12 * 1024 * 1024)
+                if not content_type.startswith("image/"):
+                    self.send_json({"error": "画像URLではありません"}, 415)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                self.send_json({"error": f"画像取得に失敗しました: {exc}"}, 502)
         elif path == "/oauth2/callback":
             # oauth2_setup.py からのリダイレクトを受け取り、コードを一時保存する
             code  = qs.get("code",  [None])[0]
@@ -5475,7 +5576,8 @@ if __name__ == "__main__":
     if not DISCORD_WEBHOOK:
         print("⚠️  DISCORD_WEBHOOK_X_DRAFT が未設定のため Discord 通知は無効です")
     print("   終了するには Ctrl+C を押してください\n")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
     try:
         server.serve_forever()
     except KeyboardInterrupt:
