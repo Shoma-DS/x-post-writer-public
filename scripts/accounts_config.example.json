@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {
+      "id": "SAMPLE",
+      "x_username": "example_handle",
+      "token_env": "X_ACCESS_TOKEN_SAMPLE",
+      "token_secret_env": "X_ACCESS_TOKEN_SECRET_SAMPLE",
+      "bookmarks_access_token_env": "X_BOOKMARKS_ACCESS_TOKEN_SAMPLE",
+      "bookmarks_refresh_token_env": "X_BOOKMARKS_REFRESH_TOKEN_SAMPLE",
+      "oauth2_access_token_env": "X_BOOKMARKS_ACCESS_TOKEN_SAMPLE",
+      "oauth2_client_id_env": "X_OAUTH2_CLIENT_ID_SAMPLE",
+      "oauth2_client_secret_env": "X_OAUTH2_CLIENT_SECRET_SAMPLE"
+    }
+  ]
+}

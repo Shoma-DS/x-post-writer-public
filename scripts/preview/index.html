@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>X 下書きプレビュー</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,300..600,0..1,-25..200&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Geist+Mono:wght@300;400&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app" id="app">
+
+    <!-- サイドバー -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="x-logo">𝕏</div>
+        <span class="sidebar-title">DRAFTS</span>
+        <button id="auth-btn" class="refresh-btn account-switch-btn google-auth-btn" onclick="handleAuthClick()" title="Googleログイン">
+          <span class="google-g" aria-hidden="true">G</span>
+        </button>
+        <button id="logout-btn" class="refresh-btn account-switch-btn logout-btn" onclick="handleLogoutClick()" title="ログアウト" aria-label="ログアウト" style="display:none"><span class="material-symbols-rounded ui-icon" aria-hidden="true">logout</span></button>
+        <button id="header-account-btn" class="refresh-btn account-switch-btn header-account-btn" onclick="openAccountModal()" title="アカウント変更">
+          <span class="avatar-sm" id="header-account-avatar"><span class="material-symbols-rounded ui-icon" aria-hidden="true">person</span></span>
+        </button>
+        <button class="refresh-btn account-switch-btn" onclick="openEnvSettingsModal()" title="設定" aria-label="設定"><span class="material-symbols-rounded ui-icon" aria-hidden="true">settings</span></button>
+        <button id="refresh-btn" class="refresh-btn" onclick="loadDraftList()" title="一覧を更新" aria-label="一覧を更新"><span class="material-symbols-rounded ui-icon" aria-hidden="true">refresh</span></button>
+      </div>
+
+      <button id="account-summary" class="account-summary" onclick="openAccountModal()">
+        <span class="avatar-sm account-summary-avatar">𝕏</span>
+        <span class="account-summary-main">
+          <span id="account-summary-name">すべてのアカウント</span>
+          <span id="account-summary-user">下書き全体を表示</span>
+        </span>
+      </button>
+
+      <div class="search-wrap">
+        <input
+          id="search-input"
+          class="search-input"
+          type="text"
+          placeholder="下書きを検索..."
+          autocomplete="off"
+          oninput="onSearch(this.value)"
+        >
+        <span class="search-icon material-symbols-rounded ui-icon" aria-hidden="true">search</span>
+      </div>
+
+      <div id="draft-list" class="draft-list">
+        <div class="loading">読み込み中...</div>
+      </div>
+    </aside>
+
+    <!-- モバイル用タブバー -->
+    <nav class="tab-bar" id="tab-bar">
+      <button class="tab-btn active" id="tab-list-btn" onclick="switchTab('list')"><span class="material-symbols-rounded ui-icon" aria-hidden="true">format_list_bulleted</span>一覧</button>
+      <button class="tab-btn" id="tab-preview-btn" onclick="switchTab('preview')"><span class="material-symbols-rounded ui-icon" aria-hidden="true">preview</span>プレビュー</button>
+    </nav>
+
+    <!-- メインプレビュー -->
+    <main class="preview-area" id="preview-area">
+      <div id="preview-content" class="preview-content">
+        <div class="empty-state">
+          <div class="x-logo-large">𝕏</div>
+          <p>左の一覧から下書きを選んでください</p>
+        </div>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- 削除確認モーダル -->
+  <div id="delete-modal" class="modal-overlay" style="display:none">
+    <div class="modal choice-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+      <h3 id="delete-modal-title">下書き削除</h3>
+      <p class="modal-msg">この下書きを削除しますか？<br>この操作は取り消せません。</p>
+      <div class="modal-actions">
+        <button class="btn-ghost" onclick="closeDeleteModal()">キャンセル</button>
+        <button class="btn-danger" id="modal-confirm-btn">削除する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ツリー投稿ガイドモーダル -->
+  <div id="thread-modal" class="modal-overlay" style="display:none" onclick="handleThreadModalBg(event)">
+    <div class="modal thread-modal" role="dialog" aria-modal="true" aria-label="ツリー投稿ガイド">
+      <div class="thread-modal-header">
+        <span id="thread-step-label" class="thread-step-label">パート 1 / 1</span>
+        <button class="thread-close-btn" onclick="closeThreadModal()" aria-label="閉じる"><span class="material-symbols-rounded ui-icon" aria-hidden="true">close</span></button>
+      </div>
+      <p id="thread-instruction" class="thread-instruction"></p>
+      <div id="thread-part-content" class="thread-part-content"></div>
+      <div class="thread-modal-actions">
+        <button class="btn-ghost thread-copy-btn" onclick="copyThreadPart()">コピー</button>
+        <button class="btn-ghost thread-copy-image-btn" id="thread-copy-image-btn" onclick="copyThreadImage()">画像をコピー</button>
+        <button id="thread-open-btn" class="post-btn thread-open-btn" onclick="openXForThread()">
+          <span class="x-mark" aria-hidden="true">𝕏</span>X アプリで開く
+        </button>
+      </div>
+      <div class="thread-nav">
+        <button id="thread-prev-btn" class="btn-ghost" onclick="prevThreadPart()"><span class="material-symbols-rounded ui-icon" aria-hidden="true">arrow_back</span>前へ</button>
+        <button id="thread-next-btn" class="mark-posted-btn" onclick="nextThreadPart()">次のパーツ<span class="material-symbols-rounded ui-icon" aria-hidden="true">arrow_forward</span></button>
+        <button id="thread-done-btn" class="mark-posted-btn" onclick="doneThreadPost()" style="display:none"><span class="material-symbols-rounded ui-icon is-filled" aria-hidden="true">task_alt</span>投稿済みにする</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <!-- Twitter oEmbed 描画用（omit_script=true で embed ごとには入れない） -->
+  <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "logos": [
+    {
+      "name": "OpenAI",
+      "aliases": ["openai", "open ai", "オープンai", "オープンエーアイ", "オープンエア", "chatgpt", "gpt", "codex", "codex cli", "コーデックス", "チャットgpt"],
+      "image_url": "https://commons.wikimedia.org/wiki/Special:FilePath/OpenAI_Logo_Since_February_2025.png",
+      "source_url": "https://openai.com/brand/",
+      "usage_note": "Codex/ChatGPT/OpenAI系の参照画像。商標利用ルールはOpenAI Brandを確認する。"
+    },
+    {
+      "name": "Claude",
+      "aliases": ["claude", "claude ai", "claude code", "クロード", "クロードコード"],
+      "image_url": "https://commons.wikimedia.org/wiki/Special:FilePath/Claude_AI_logo.png",
+      "source_url": "https://claude.ai/",
+      "usage_note": "Claude/Claude Code系の参照画像。必要なら個人設定側で公式配布画像に差し替える。"
+    },
+    {
+      "name": "Anthropic",
+      "aliases": ["anthropic", "anthropic社", "アンソロピック", "アンスロピック"],
+      "image_url": "https://commons.wikimedia.org/wiki/Special:FilePath/Anthropic.png",
+      "source_url": "https://www.anthropic.com/",
+      "usage_note": "Anthropic社名を図解に入れるときの参照画像。"
+    },
+    {
+      "name": "GitHub",
+      "aliases": ["github", "git hub", "ギットハブ"],
+      "image_url": "https://commons.wikimedia.org/wiki/Special:FilePath/GitHub_Mark.png",
+      "source_url": "https://github.com/logos",
+      "usage_note": "GitHub Markの参照画像。商標利用ルールはGitHub Logosを確認する。"
+    }
+  ]
+}

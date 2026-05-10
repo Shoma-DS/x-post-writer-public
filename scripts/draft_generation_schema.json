@@ -1,0 +1,93 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "account_id",
+    "x_username",
+    "run_summary",
+    "drafts",
+    "skipped"
+  ],
+  "properties": {
+    "account_id": {
+      "type": "string"
+    },
+    "x_username": {
+      "type": "string"
+    },
+    "run_summary": {
+      "type": "string"
+    },
+    "drafts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bookmark_tweet_id",
+          "author_username",
+          "memo",
+          "rationale",
+          "parts",
+          "image_prompt"
+        ],
+        "properties": {
+          "bookmark_tweet_id": {
+            "type": "string"
+          },
+          "author_username": {
+            "type": "string"
+          },
+          "memo": {
+            "type": "string"
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "parts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "image_prompt": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "copy",
+              "prompt"
+            ],
+            "properties": {
+              "copy": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bookmark_tweet_id",
+          "reason"
+        ],
+        "properties": {
+          "bookmark_tweet_id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
