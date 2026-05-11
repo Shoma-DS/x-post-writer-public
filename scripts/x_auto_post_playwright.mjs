@@ -198,7 +198,7 @@ async function loadPlaywright() {
     return await import('playwright');
   } catch (error) {
     throw new Error(
-      'Playwright is not installed. Run npm install in scripts, then retry.'
+      'Playwright is not installed. Run npm install in x-post-writer/scripts, then retry.'
     );
   }
 }
@@ -641,7 +641,7 @@ async function ensureLoggedIn(page) {
 
 async function main() {
   if (process.argv.includes('--login')) {
-    const profileDir = process.env.X_PLAYWRIGHT_PROFILE_DIR || path.join(os.homedir(), '.x-post-writer-playwright', 'x-profile');
+    const profileDir = process.env.X_PLAYWRIGHT_PROFILE_DIR || path.join(os.homedir(), 'Desktop', 'X運用', 'runtime', 'playwright-x-profile');
     await openNormalChromeForLogin(profileDir);
     console.log(JSON.stringify({
       ok: true,
@@ -656,7 +656,7 @@ async function main() {
   const payloadPath = argValue('--payload');
   if (!payloadPath) throw new Error('--payload is required');
   const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
-  payload.profile_dir = payload.profile_dir || path.join(os.homedir(), '.x-post-writer-playwright', 'x-profile');
+  payload.profile_dir = payload.profile_dir || path.join(os.homedir(), 'Desktop', 'X運用', 'runtime', 'playwright-x-profile');
   payload.screenshot_dir = payload.screenshot_dir || path.join(os.homedir(), '.openclaw', 'media', 'browser');
   payload.parts = Array.isArray(payload.parts) ? payload.parts.map(part => String(part || '')) : [];
   if (!payload.parts.length || !payload.parts[0].trim()) throw new Error('payload.parts[0] is required');

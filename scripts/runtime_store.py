@@ -1,6 +1,6 @@
 # X投稿自動化のランタイム成果物を repo 外に保存する補助モジュール。
 # 画像プロンプト、下書きメタデータ、処理済みブックマーク state を一元管理する。
-# 保存先は ~/.config/x-post-writer/x-post-writer/ 配下。
+# 保存先は ~/Desktop/X運用/runtime/x-post-writer/ 配下。
 
 from __future__ import annotations
 
@@ -10,20 +10,15 @@ import re
 from pathlib import Path
 
 
-APP_NAME = "x-post-writer"
+APP_NAME = "x-operation"
 FEATURE_DIR = "x-post-writer"
+X_OPS_ROOT = Path(os.environ.get("X_OPS_ROOT", str(Path.home() / "Desktop" / "X運用")))
 BOOKMARK_STATE_FILENAME = "processed_bookmarks_state.json"
 CHARACTER_SETTINGS_FILENAME = "character-settings.json"
 
 
 def get_config_root() -> Path:
-    base = Path(
-        os.environ.get(
-            "XDG_CONFIG_HOME",
-            str(Path.home() / ".config"),
-        )
-    )
-    return base / APP_NAME / FEATURE_DIR
+    return X_OPS_ROOT / "runtime" / FEATURE_DIR
 
 
 def ensure_dir(path: Path) -> Path:

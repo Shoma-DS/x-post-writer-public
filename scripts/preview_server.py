@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote as urlquote, urlencode, unquote, urljoin
@@ -32,9 +32,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from runtime_store import (
     get_runtime_root,
+    load_bookmark_state_payload,
     load_character_setting,
     load_draft_metadata,
     save_character_setting,
+    save_bookmark_state_payload,
     save_draft_metadata,
     slugify,
 )
@@ -96,12 +98,15 @@ PUBLIC_URL = os.environ.get("LT_PUBLIC_URL", f"http://localhost:{PORT}")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_X_DRAFT", "")
 LOCAL_IMAGE_ROOTS = [
     WORKSPACE_ROOT / "runtime",
+    WORKSPACE_ROOT / "private",
     WORKSPACE_ROOT / "public",
     REPO_ROOT / "runtime",
     Path(os.environ.get("X_POST_WRITER_ROOT", WORKSPACE_ROOT)) / "runtime",
     Path(os.environ.get("X_POST_RUNTIME_ROOT", str(WORKSPACE_ROOT / "runtime"))),
     Path.home() / ".config" / "x-post-writer",
+    Path.home() / ".agents",
     Path.home() / ".codex" / "generated_images",
+    Path.home() / "x-post-writer",
 ]
 OBSIDIAN_VAULT_ENV_KEYS = ("X_POST_OBSIDIAN_VAULT", "OBSIDIAN_VAULT_PATH")
 
@@ -259,6 +264,15 @@ def ensure_multi_user_schema() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE (user_id, name)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS draft_tweet_links (
+                    draft_id UUID PRIMARY KEY REFERENCES drafts(draft_id) ON DELETE CASCADE,
+                    tweet_id TEXT NOT NULL UNIQUE,
+                    linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    note TEXT NOT NULL DEFAULT ''
                 )
             """)
             for table in ("accounts", "drafts"):
@@ -456,6 +470,7 @@ def fetch_drafts(account: str = "", *, limit: int = 20, offset: int = 0, query: 
             result = []
             for draft in drafts:
                 draft_id = str(draft["draft_id"])
+                metadata = load_draft_metadata(draft_id) or {}
                 result.append({
                     "draft_id": draft_id,
                     "x_username": draft["x_username"],
@@ -468,6 +483,7 @@ def fetch_drafts(account: str = "", *, limit: int = 20, offset: int = 0, query: 
                     "preview_content": draft["preview_content"] or "",
                     "created_at": draft["created_at"].strftime("%Y-%m-%d %H:%M"),
                     "published_at": draft["published_at"].strftime("%Y-%m-%d %H:%M") if draft["published_at"] else None,
+                    "draft_score": metadata.get("draft_score") or None,
                     "obsidian_save": obsidian_saved_index.get(draft_id, {"saved": False}),
                 })
             return {
@@ -613,6 +629,412 @@ def _load_original_tweet(draft_id: str, seen: set[str] | None = None) -> dict | 
     }
 
 
+def _bookmarks_payload() -> dict:
+    if not BOOKMARKS_FILE.exists():
+        return {"bookmarks": []}
+    try:
+        payload = json.loads(BOOKMARKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"bookmarks": []}
+    return payload if isinstance(payload, dict) else {"bookmarks": []}
+
+
+def _metric_int(metrics: dict, key: str) -> int:
+    if not isinstance(metrics, dict):
+        return 0
+    try:
+        return int(metrics.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metrics_from_public(metrics: dict) -> dict:
+    return {
+        "impressions": _metric_int(metrics, "impression_count"),
+        "likes": _metric_int(metrics, "like_count"),
+        "retweets": _metric_int(metrics, "retweet_count"),
+        "bookmarks": _metric_int(metrics, "bookmark_count"),
+        "replies": _metric_int(metrics, "reply_count"),
+        "quotes": _metric_int(metrics, "quote_count"),
+    }
+
+
+def _sum_source_metrics(items: list[dict]) -> dict:
+    totals = {key: 0 for key in ("impressions", "likes", "retweets", "bookmarks", "replies", "quotes")}
+    for item in items:
+        metrics = item.get("metrics") if isinstance(item, dict) else {}
+        if not isinstance(metrics, dict):
+            continue
+        for key in totals:
+            totals[key] += int(metrics.get(key) or 0)
+    return totals
+
+
+def _has_metric_signal(metrics: dict) -> bool:
+    return any(int(metrics.get(key) or 0) > 0 for key in ("impressions", "likes", "retweets", "bookmarks", "replies", "quotes"))
+
+
+def _source_thread_parts(item: dict) -> list[dict]:
+    raw_parts = item.get("thread_parts") if isinstance(item.get("thread_parts"), list) else []
+    parts: list[dict] = []
+    for index, part in enumerate(raw_parts, 1):
+        if not isinstance(part, dict):
+            continue
+        tweet_id = str(part.get("tweet_id") or "")
+        text = str(part.get("text") or "").strip()
+        if not tweet_id and not text:
+            continue
+        public_metrics = part.get("public_metrics") if isinstance(part.get("public_metrics"), dict) else {}
+        metrics = part.get("metrics") if isinstance(part.get("metrics"), dict) else _metrics_from_public(public_metrics)
+        author = item.get("author_username") or part.get("author_username") or ""
+        parts.append({
+            "tweet_id": tweet_id,
+            "position": int(part.get("position") or index),
+            "text": text,
+            "created_at": part.get("created_at") or "",
+            "tweet_url": part.get("tweet_url") or (f"https://x.com/{author}/status/{tweet_id}" if author and tweet_id else ""),
+            "metrics": metrics,
+            "media": part.get("media") if isinstance(part.get("media"), list) else [],
+        })
+    parts.sort(key=lambda p: (int(p.get("position") or 0), str(p.get("tweet_id") or "")))
+    return parts
+
+
+def _source_post_text(item: dict) -> str:
+    thread_parts = _source_thread_parts(item)
+    if thread_parts:
+        texts = [str(part.get("text") or "").strip() for part in thread_parts if isinstance(part, dict)]
+        return "\n".join(text for text in texts if text).strip() or str(item.get("text") or "")
+    return str(item.get("text") or "")
+
+
+def _source_post_metrics(item: dict) -> dict:
+    root_metrics = _metrics_from_public(item.get("public_metrics") if isinstance(item.get("public_metrics"), dict) else {})
+    thread_parts = _source_thread_parts(item)
+    if len(thread_parts) > 1:
+        thread_metrics = _sum_source_metrics(thread_parts)
+        if _has_metric_signal(thread_metrics):
+            return thread_metrics
+    return root_metrics
+
+
+def _rate_from_metrics(metrics: dict) -> float:
+    impressions = int(metrics.get("impressions") or 0)
+    if impressions <= 0:
+        return 0.0
+    engagements = sum(int(metrics.get(key) or 0) for key in ("likes", "retweets", "bookmarks", "replies", "quotes"))
+    return round(engagements / impressions * 100, 2)
+
+
+def _bookmark_status_index() -> dict:
+    payload = load_bookmark_state_payload()
+    statuses = payload.get("bookmark_status")
+    return statuses if isinstance(statuses, dict) else {}
+
+
+def _source_analysis_index() -> dict:
+    payload = load_bookmark_state_payload()
+    analyses = payload.get("source_post_analysis")
+    return analyses if isinstance(analyses, dict) else {}
+
+
+def _save_source_analysis(tweet_id: str, analysis: dict) -> None:
+    payload = load_bookmark_state_payload()
+    analyses = payload.get("source_post_analysis")
+    if not isinstance(analyses, dict):
+        analyses = {}
+    analyses[str(tweet_id)] = analysis
+    payload["source_post_analysis"] = analyses
+    save_bookmark_state_payload(payload)
+
+
+def source_post_url(item: dict) -> str:
+    username = item.get("author_username") or "i"
+    tweet_id = item.get("tweet_id") or ""
+    return f"https://x.com/{username}/status/{tweet_id}" if tweet_id else ""
+
+
+def _source_post_tags(item: dict, text: str, thread_parts: list[dict], metrics: dict) -> list[str]:
+    haystack = text.lower()
+    tags: list[str] = []
+    if len(thread_parts) > 1:
+        tags.append("ツリー")
+    if item.get("media") or any(part.get("media") for part in thread_parts):
+        tags.append("メディア")
+    if re.search(r"\d|万|円|%|倍|ヶ月|日|時間|個|つ", text):
+        tags.append("数字")
+    if re.search(r"(①|②|③|1\.|2\.|3\.|ステップ|手順|まず|次に|最後)", text):
+        tags.append("手順")
+    if re.search(r"(比較|違い| vs |VS|より|従来|今まで|Before|After|左|中央|右)", text, re.IGNORECASE):
+        tags.append("比較")
+    if re.search(r"[?？]", text):
+        tags.append("問い")
+    if re.search(r"(👇|↓|詳しく|保存|試|見て|リプ|URL|http)", text):
+        tags.append("CTA")
+    if re.search(r"(ai|chatgpt|claude|codex|openai|gemini|cursor|agent|エージェント|自動化)", haystack, re.IGNORECASE):
+        tags.append("AI")
+    if re.search(r"(obsidian|notion|knowledge|ナレッジ|メモ|ノート)", haystack, re.IGNORECASE):
+        tags.append("知識管理")
+    if re.search(r"(unity|blender|web|アプリ|開発|コード|github|remotion|動画)", haystack, re.IGNORECASE):
+        tags.append("開発")
+    if re.search(r"(稼|売上|月商|副業|収益|マネタイズ|課金|万円)", text):
+        tags.append("収益化")
+    if _has_metric_signal(metrics):
+        tags.append("数値あり")
+    if not tags:
+        tags.append("素材")
+    return list(dict.fromkeys(tags))[:10]
+
+
+def fetch_source_posts(query: str = "", limit: int = 100, author: str = "", tag: str = "") -> dict:
+    payload = _bookmarks_payload()
+    bookmarks = payload.get("bookmarks") if isinstance(payload.get("bookmarks"), list) else []
+    statuses = _bookmark_status_index()
+    analyses = _source_analysis_index()
+    q = (query or "").strip().lower()
+    author_filter = (author or "").strip().lower()
+    tag_filter = (tag or "").strip()
+    author_counts: dict[str, dict] = {}
+    tag_counts: dict[str, int] = {}
+    items = []
+    for item in bookmarks:
+        if not isinstance(item, dict):
+            continue
+        text = _source_post_text(item)
+        thread_parts = _source_thread_parts(item)
+        metrics = _source_post_metrics(item)
+        tags = _source_post_tags(item, text, thread_parts, metrics)
+        username = str(item.get("author_username") or "")
+        author_key = username.lower()
+        if author_key:
+            author_counts.setdefault(author_key, {
+                "author_username": username,
+                "author_name": item.get("author_name") or username,
+                "count": 0,
+            })
+            author_counts[author_key]["count"] += 1
+        for item_tag in tags:
+            tag_counts[item_tag] = tag_counts.get(item_tag, 0) + 1
+        searchable = " ".join([
+            text,
+            username,
+            str(item.get("author_name") or ""),
+            str(item.get("tweet_id") or ""),
+            " ".join(tags),
+        ]).lower()
+        if q and q not in searchable:
+            continue
+        if author_filter and author_key != author_filter:
+            continue
+        if tag_filter and tag_filter not in tags:
+            continue
+        tweet_id = str(item.get("tweet_id") or "")
+        status = statuses.get(tweet_id) if isinstance(statuses.get(tweet_id), dict) else {}
+        analysis = analyses.get(tweet_id) if isinstance(analyses.get(tweet_id), dict) else None
+        if analysis and ("thread_analysis" not in analysis or "改善案" in str(analysis.get("overview") or "")):
+            analysis = None
+        items.append({
+            "tweet_id": tweet_id,
+            "tweet_url": source_post_url(item),
+            "text": text,
+            "author_username": username,
+            "author_name": item.get("author_name") or "",
+            "conversation_id": str(item.get("conversation_id") or tweet_id),
+            "created_at": item.get("created_at") or "",
+            "thread_part_count": len(thread_parts),
+            "thread_parts": thread_parts,
+            "tags": tags,
+            "media": item.get("media") or [],
+            "metrics": metrics,
+            "engagement_rate": _rate_from_metrics(metrics),
+            "status": status.get("status") or "",
+            "draft_id": status.get("draft_id") or "",
+            "analysis": analysis,
+        })
+    return {
+        "items": items[: max(1, min(int(limit or 100), 300))],
+        "total": len(items),
+        "facets": {
+            "authors": sorted(author_counts.values(), key=lambda x: (-int(x["count"]), str(x["author_username"]).lower()))[:80],
+            "tags": [{"tag": key, "count": value} for key, value in sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))[:80]],
+        },
+        "account_profile": payload.get("account_profile") or {},
+        "fetched_at": payload.get("fetched_at") or "",
+    }
+
+
+def analyze_source_post_item(item: dict) -> dict:
+    text = _source_post_text(item)
+    metrics = _source_post_metrics(item)
+    media = item.get("media") if isinstance(item.get("media"), list) else []
+    thread_parts = _source_thread_parts(item)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    first_line = lines[0] if lines else ""
+    has_number = bool(re.search(r"\d|万|円|%|倍|ヶ月|日|時間|個|つ", text))
+    has_question = bool(re.search(r"[?？]", first_line))
+    has_loss = bool(re.search(r"損|危険|注意|知ら|失敗|伸びない|やば|衝撃|実は", text))
+    has_steps = bool(re.search(r"(①|②|③|1\.|2\.|3\.|ステップ|手順|まず|次に|最後)", text))
+    has_comparison = bool(re.search(r"(比較|違い| vs |VS|より|従来|今まで|Before|After|左|中央|右)", text, re.IGNORECASE))
+    has_cta = bool(re.search(r"(👇|↓|詳しく|保存|試|見て|リプ|URL|http)", text))
+    is_thread = len(thread_parts) > 1
+    hook_type = "数字・具体性" if has_number else "損失回避" if has_loss else "疑問提示" if has_question else "情報提示"
+    strengths: list[dict] = []
+    if first_line:
+        strengths.append({"title": "冒頭フック", "detail": f"1行目が「{first_line[:60]}」で始まり、{hook_type}の入口を作っています。"})
+    if has_number:
+        strengths.append({"title": "具体性", "detail": "数字・金額・期間などが入っていて、読者が規模感を即座に判断できます。"})
+    if has_comparison:
+        strengths.append({"title": "比較構造", "detail": "比較軸があるため、何が新しいのか、何が違うのかを理解しやすい投稿です。"})
+    if has_steps:
+        strengths.append({"title": "再現性", "detail": "手順や順番が見えるので、読者が自分でも試せそうだと感じやすい構造です。"})
+    if media:
+        strengths.append({"title": "視覚フック", "detail": "画像・動画があり、タイムライン上で本文に入る前の停止理由を作れています。"})
+    if is_thread:
+        strengths.append({"title": "ツリー展開", "detail": f"{len(thread_parts)}パーツで話を展開しており、冒頭の興味から補足・納得まで段階的に読ませる型です。"})
+    if has_cta:
+        strengths.append({"title": "読後導線", "detail": "最後にURL・保存・詳しく見るなどの行動導線があり、読後の次アクションが作られています。"})
+    if not strengths:
+        strengths.append({"title": "論点の素材性", "detail": "話題の切り口が明確で、読者の関心領域を探る素材として使えます。"})
+
+    observed_patterns: list[dict] = []
+    def add_pattern(pattern_id: str, title: str, detail: str, rule: str) -> None:
+        observed_patterns.append({
+            "id": pattern_id,
+            "title": title,
+            "detail": detail,
+            "rule": rule,
+            "selected": True,
+        })
+
+    if has_number:
+        add_pattern(
+            "source-number",
+            "数字で期待値を固定している",
+            "数字があることで、読者は投稿を読む前に規模・手間・効果を想像できます。",
+            "良い元投稿から型を借りる時は、数字が担っている期待値設定の役割を確認する。",
+        )
+    if has_loss or has_question:
+        add_pattern(
+            "source-hook-tension",
+            "冒頭で緊張感を作っている",
+            "疑問・損失・違和感のどれかで、続きを読む理由を冒頭に置いています。",
+            "良い元投稿を分析するときは、冒頭が読者にどんな緊張感を与えているかを記録する。",
+        )
+    if has_comparison:
+        add_pattern(
+            "source-comparison",
+            "比較で理解を速くしている",
+            "比較対象を置くことで、読者が価値差を一瞬で掴める構造になっています。",
+            "比較型の元投稿は、比較対象・差分・結論の順で型として保存する。",
+        )
+    if has_steps:
+        add_pattern(
+            "source-steps",
+            "手順化で保存理由を作っている",
+            "流れや順番が見えるため、あとで見返す価値が生まれています。",
+            "手順型の元投稿は、各ステップが何を解決しているかまで観察する。",
+        )
+    if media:
+        add_pattern(
+            "source-media-proof",
+            "メディアが証拠・雰囲気を補強している",
+            "画像や動画が本文の前提を補強し、スクロール停止と理解補助の両方を担っています。",
+            "メディア付き元投稿は、画像が証拠・結果・雰囲気のどれを担っているか分類する。",
+        )
+    if is_thread:
+        add_pattern(
+            "source-thread-flow",
+            "ツリーで役割分担している",
+            "1投稿目で興味を作り、後続で具体化・補足・納得へ進める構成です。",
+            "ツリー型の元投稿は、各パーツの役割を導入・展開・補強・締めに分けて保存する。",
+        )
+    if has_cta:
+        add_pattern(
+            "source-cta",
+            "読後行動まで設計している",
+            "本文を読んだあとに、URL・保存・確認などの行動へ自然に移れます。",
+            "良い元投稿は、最後にどんな行動を促しているかを観察メモとして残す。",
+        )
+    if not observed_patterns:
+        add_pattern(
+            "source-topic-angle",
+            "話題選定で関心を拾っている",
+            "構文よりも、読者が反応しやすいテーマや固有名詞を押さえている可能性があります。",
+            "構造が薄い元投稿でも、テーマ・固有名詞・読者の関心領域は観察対象として残す。",
+        )
+
+    part_reports: list[dict] = []
+    if is_thread:
+        for index, part in enumerate(thread_parts, 1):
+            part_text = str(part.get("text") or "").strip()
+            if index == 1:
+                role = "導入"
+                good_point = "ツリー全体を読む理由を作る冒頭パートです。"
+            elif index == len(thread_parts):
+                role = "締め"
+                good_point = "読後の納得や次アクションをまとめる締めのパートです。"
+            elif re.search(r"\d|①|②|③|ステップ|手順|例", part_text):
+                role = "具体化"
+                good_point = "数字・例・手順で前段の主張を具体化しています。"
+            else:
+                role = "展開"
+                good_point = "冒頭の論点を広げ、読者の理解を進める展開パートです。"
+            part_reports.append({
+                "position": index,
+                "tweet_id": part.get("tweet_id") or "",
+                "role": role,
+                "excerpt": part_text[:140],
+                "good_point": good_point,
+                "metrics": part.get("metrics") or {},
+            })
+
+    flow_summary = ""
+    if is_thread:
+        roles = " → ".join(part.get("role", "") for part in part_reports[:8] if part.get("role"))
+        flow_summary = f"{len(thread_parts)}パーツ構成。流れは {roles}。"
+
+    score = 40 + (12 if has_number else 0) + (12 if has_loss or has_question else 0) + (12 if has_comparison else 0) + (12 if has_steps else 0) + (8 if media else 0) + (4 if has_cta else 0)
+    score += 8 if is_thread else 0
+    score = max(0, min(100, score))
+    tags = _source_post_tags(item, text, thread_parts, metrics)
+    analysis = {
+        "tweet_id": str(item.get("tweet_id") or ""),
+        "score": score,
+        "hook_type": hook_type,
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+        "overview": f"この元投稿の良さは、{hook_type}の入口と、読者が理解しやすい構造を持っている点です。欠けているものの指摘ではなく、どの要素がタイムラインで止まる理由になっているかを分解します。",
+        "structure": {
+            "line_count": len(lines),
+            "thread_part_count": len(thread_parts),
+            "has_number": has_number,
+            "has_comparison": has_comparison,
+            "has_steps": has_steps,
+            "has_media": bool(media),
+            "has_cta": has_cta,
+            "is_thread": is_thread,
+        },
+        "tags": tags,
+        "metrics": metrics,
+        "engagement_rate": _rate_from_metrics(metrics),
+        "strengths": strengths[:5],
+        "thread_analysis": {
+            "summary": flow_summary,
+            "parts": part_reports,
+        },
+        "transfer_points": observed_patterns[:6],
+    }
+    _save_source_analysis(str(item.get("tweet_id") or ""), analysis)
+    return analysis
+
+
+def analyze_source_post(tweet_id: str) -> dict:
+    payload = _bookmarks_payload()
+    for item in payload.get("bookmarks") or []:
+        if isinstance(item, dict) and str(item.get("tweet_id") or "") == str(tweet_id):
+            return analyze_source_post_item(item)
+    raise RuntimeError("元投稿が見つかりません")
+
+
 def fetch_draft(draft_id):
     conn = get_db_conn()
     try:
@@ -658,10 +1080,323 @@ def fetch_draft(draft_id):
                     for p in parts
                 ],
                 "image_prompts": image_prompts,
+                "draft_score": metadata.get("draft_score") or None,
                 "character_reference": metadata.get("character_reference") or {},
                 "character_setting": character_setting,
                 "original_tweet": _load_original_tweet(str(draft["draft_id"])),
                 "obsidian_save": get_obsidian_save_state(str(draft["draft_id"])),
+            }
+    finally:
+        conn.close()
+
+
+def _normalize_match_text(value: str) -> str:
+    text = re.sub(r"https?://\S+", "", str(value or ""))
+    text = re.sub(r"\s+", "", text).lower()
+    return text[:500]
+
+
+def _text_similarity(a: str, b: str) -> float:
+    a_norm = _normalize_match_text(a)
+    b_norm = _normalize_match_text(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm in b_norm or b_norm in a_norm:
+        return 1.0
+    a_chunks = {a_norm[i:i + 3] for i in range(max(1, len(a_norm) - 2))}
+    b_chunks = {b_norm[i:i + 3] for i in range(max(1, len(b_norm) - 2))}
+    if not a_chunks or not b_chunks:
+        return 0.0
+    return round(len(a_chunks & b_chunks) / len(a_chunks | b_chunks), 3)
+
+
+AUTO_METRICS_LINK_THRESHOLD = 0.72
+AUTO_METRICS_AMBIGUOUS_MARGIN = 0.08
+
+
+def _auto_linkable_candidate(candidates: list[dict]) -> tuple[dict | None, str]:
+    if not candidates:
+        return None, "候補なし"
+    top = candidates[0]
+    top_score = float(top.get("similarity") or 0)
+    second_score = float(candidates[1].get("similarity") or 0) if len(candidates) > 1 else 0
+    if top_score < AUTO_METRICS_LINK_THRESHOLD:
+        return None, f"類似度不足 {top_score:.2f}"
+    if second_score and (top_score - second_score) < AUTO_METRICS_AMBIGUOUS_MARGIN:
+        return None, f"候補が近すぎる {top_score:.2f}/{second_score:.2f}"
+    return top, f"類似度 {top_score:.2f}"
+
+
+def _latest_metric_from_row(row: dict | None) -> dict:
+    if not row:
+        return {
+            "impressions": 0,
+            "likes": 0,
+            "retweets": 0,
+            "bookmarks": 0,
+            "replies": 0,
+            "quotes": 0,
+            "profile_clicks": 0,
+            "url_clicks": 0,
+            "engagements": 0,
+            "engagement_rate": 0,
+            "snapshot_at": None,
+            "hours_after_post": None,
+        }
+    metrics = {
+        "impressions": int(row.get("impression_count") or 0),
+        "likes": int(row.get("like_count") or 0),
+        "retweets": int(row.get("retweet_count") or 0),
+        "bookmarks": int(row.get("bookmark_count") or 0),
+        "replies": int(row.get("reply_count") or 0),
+        "quotes": int(row.get("quote_count") or 0),
+        "profile_clicks": int(row.get("profile_click_count") or 0),
+        "url_clicks": int(row.get("url_link_click_count") or 0),
+        "engagements": int(row.get("engagement_count") or 0),
+        "snapshot_at": row.get("snapshot_at").strftime("%Y-%m-%d %H:%M") if row.get("snapshot_at") else None,
+        "hours_after_post": float(row.get("hours_after_post") or 0) if row.get("hours_after_post") is not None else None,
+    }
+    engagement_value = metrics["engagements"] or sum(metrics[key] for key in ("likes", "retweets", "bookmarks", "replies", "quotes"))
+    metrics["engagement_rate"] = round(engagement_value / metrics["impressions"] * 100, 2) if metrics["impressions"] else 0
+    return metrics
+
+
+def link_draft_to_tweet(draft_id: str, tweet_id: str, source: str = "manual") -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT draft_id
+                FROM draft_tweet_links
+                WHERE tweet_id = %s AND draft_id <> %s
+                LIMIT 1
+            """, (str(tweet_id), draft_id))
+            existing = cur.fetchone()
+            if existing:
+                return {
+                    "draft_id": str(draft_id),
+                    "tweet_id": str(tweet_id),
+                    "skipped": True,
+                    "reason": "tweet_already_linked",
+                    "existing_draft_id": str(existing[0]),
+                }
+            cur.execute("""
+                INSERT INTO draft_tweet_links (draft_id, tweet_id, source)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (draft_id) DO UPDATE
+                   SET tweet_id = EXCLUDED.tweet_id,
+                       source = EXCLUDED.source,
+                       linked_at = NOW()
+            """, (draft_id, str(tweet_id), source or "manual"))
+            conn.commit()
+    finally:
+        conn.close()
+
+    metadata = load_draft_metadata(str(draft_id)) or {"draft_id": str(draft_id)}
+    metadata["published_tweet_id"] = str(tweet_id)
+    metadata["metrics_linked_at"] = datetime.now(timezone.utc).isoformat()
+    save_draft_metadata(str(draft_id), metadata)
+    return {"draft_id": str(draft_id), "tweet_id": str(tweet_id), "skipped": False}
+
+
+def fetch_analytics_dashboard(account: str = "") -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            account_where = ""
+            params: list = []
+            if account and account.lower() not in {"all", "__anonymous__"}:
+                account_where = "WHERE lower(a.x_username) = lower(%s)"
+                params.append(account)
+
+            try:
+                cur.execute(f"""
+                    SELECT t.tweet_id, t.content, t.posted_at, t.post_type,
+                           a.x_username, a.display_name,
+                           l.draft_id,
+                           s.snapshot_at, s.hours_after_post,
+                           s.impression_count, s.like_count, s.retweet_count, s.bookmark_count,
+                           s.reply_count, s.quote_count, s.profile_click_count, s.url_link_click_count,
+                           s.engagement_count
+                    FROM tweets t
+                    JOIN accounts a ON t.account_id = a.account_id
+                    LEFT JOIN draft_tweet_links l ON l.tweet_id = t.tweet_id
+                    LEFT JOIN LATERAL (
+                        SELECT *
+                        FROM tweet_metrics_snapshots s
+                        WHERE s.tweet_id = t.tweet_id
+                        ORDER BY s.snapshot_at DESC
+                        LIMIT 1
+                    ) s ON TRUE
+                    {account_where}
+                    ORDER BY t.posted_at DESC
+                    LIMIT 120
+                """, tuple(params))
+                tweet_rows = [dict(row) for row in cur.fetchall()]
+            except Exception:
+                conn.rollback()
+                tweet_rows = []
+
+            tweets = []
+            total = {
+                "posts": 0,
+                "impressions": 0,
+                "likes": 0,
+                "retweets": 0,
+                "bookmarks": 0,
+                "replies": 0,
+                "engagements": 0,
+            }
+            for row in tweet_rows:
+                metrics = _latest_metric_from_row(row)
+                total["posts"] += 1
+                for key in ("impressions", "likes", "retweets", "bookmarks", "replies", "engagements"):
+                    total[key] += int(metrics.get(key) or 0)
+                tweets.append({
+                    "tweet_id": str(row.get("tweet_id") or ""),
+                    "tweet_url": f"https://x.com/{row.get('x_username')}/status/{row.get('tweet_id')}",
+                    "x_username": row.get("x_username") or "",
+                    "display_name": row.get("display_name") or row.get("x_username") or "",
+                    "content": row.get("content") or "",
+                    "posted_at": row.get("posted_at").strftime("%Y-%m-%d %H:%M") if row.get("posted_at") else "",
+                    "post_type": row.get("post_type") or "",
+                    "draft_id": str(row.get("draft_id") or ""),
+                    "metrics": metrics,
+                })
+
+            try:
+                cur.execute(f"""
+                    SELECT amd.snapshot_date, a.x_username,
+                           amd.followers_count, amd.following_count, amd.tweet_count,
+                           amd.cumulative_impressions, amd.cumulative_likes, amd.cumulative_retweets,
+                           amd.cumulative_bookmarks, amd.cumulative_engagements,
+                           amd.daily_post_count, amd.daily_reply_count, amd.daily_thread_count, amd.daily_long_count
+                    FROM account_metrics_daily amd
+                    JOIN accounts a ON amd.account_id = a.account_id
+                    {account_where}
+                    ORDER BY amd.snapshot_date ASC
+                    LIMIT 90
+                """, tuple(params))
+                daily = [
+                    {
+                        **dict(row),
+                        "snapshot_date": row["snapshot_date"].isoformat() if row.get("snapshot_date") else "",
+                    }
+                    for row in cur.fetchall()
+                ]
+            except Exception:
+                conn.rollback()
+                daily = []
+
+            cur.execute(f"""
+                SELECT d.draft_id, d.status, d.memo, d.created_at, d.published_at,
+                       a.x_username, a.display_name,
+                       (
+                         SELECT p.content FROM draft_parts p
+                         WHERE p.draft_id = d.draft_id
+                         ORDER BY p.position
+                         LIMIT 1
+                       ) AS preview_content,
+                       l.tweet_id AS linked_tweet_id
+                FROM drafts d
+                JOIN accounts a ON d.account_id = a.account_id
+                LEFT JOIN draft_tweet_links l ON l.draft_id = d.draft_id
+                WHERE d.status = 'published'
+                {('AND lower(a.x_username) = lower(%s)' if account and account.lower() not in {'all', '__anonymous__'} else '')}
+                ORDER BY d.published_at DESC NULLS LAST, d.created_at DESC
+                LIMIT 80
+            """, tuple(params))
+            posted_drafts = []
+            auto_linked_count = 0
+            linked_tweet_ids_used = {tweet["tweet_id"] for tweet in tweets if tweet.get("draft_id")}
+            for row in cur.fetchall():
+                draft_id = str(row["draft_id"])
+                metadata = load_draft_metadata(draft_id) or {}
+                linked_tweet_id = str(row.get("linked_tweet_id") or metadata.get("published_tweet_id") or "")
+                linked_tweet = next((tweet for tweet in tweets if tweet["tweet_id"] == linked_tweet_id), None)
+                if linked_tweet_id:
+                    linked_tweet_ids_used.add(linked_tweet_id)
+                    if not row.get("linked_tweet_id") and linked_tweet:
+                        link_draft_to_tweet(draft_id, linked_tweet_id, "metadata")
+                candidates = []
+                if not linked_tweet_id:
+                    same_account = [tweet for tweet in tweets if (tweet.get("x_username") or "").lower() == (row.get("x_username") or "").lower()]
+                    for tweet in same_account[:60]:
+                        if tweet["tweet_id"] in linked_tweet_ids_used:
+                            continue
+                        similarity = _text_similarity(row.get("preview_content") or "", tweet.get("content") or "")
+                        if similarity >= 0.18:
+                            candidates.append({
+                                "tweet_id": tweet["tweet_id"],
+                                "tweet_url": tweet["tweet_url"],
+                                "posted_at": tweet["posted_at"],
+                                "content": tweet["content"][:140],
+                                "similarity": similarity,
+                                "metrics": tweet["metrics"],
+                            })
+                    candidates.sort(key=lambda item: item["similarity"], reverse=True)
+                    auto_candidate, auto_reason = _auto_linkable_candidate(candidates)
+                    if auto_candidate:
+                        link_result = link_draft_to_tweet(draft_id, auto_candidate["tweet_id"], "auto-similarity")
+                        if not link_result.get("skipped"):
+                            linked_tweet_id = auto_candidate["tweet_id"]
+                            linked_tweet_ids_used.add(linked_tweet_id)
+                            linked_tweet = next((tweet for tweet in tweets if tweet["tweet_id"] == linked_tweet_id), None)
+                            auto_linked_count += 1
+                            match_status = "auto_linked"
+                            match_reason = auto_reason
+                            match_confidence = float(auto_candidate.get("similarity") or 0)
+                        else:
+                            match_status = "unlinked_conflict"
+                            match_reason = "候補が別下書きに紐づけ済み"
+                            match_confidence = float(auto_candidate.get("similarity") or 0)
+                    elif candidates:
+                        match_status = "unlinked_low_confidence"
+                        match_reason = auto_reason
+                        match_confidence = float(candidates[0].get("similarity") or 0)
+                    else:
+                        match_status = "unlinked_no_candidate"
+                        match_reason = "一致候補なし"
+                        match_confidence = 0.0
+                elif linked_tweet:
+                    match_status = "linked"
+                    match_reason = "紐づけ済み"
+                    match_confidence = 1.0
+                else:
+                    match_status = "linked_missing_metrics"
+                    match_reason = "紐づけ先の数値データ未取得"
+                    match_confidence = 1.0
+                posted_drafts.append({
+                    "draft_id": draft_id,
+                    "x_username": row.get("x_username") or "",
+                    "display_name": row.get("display_name") or row.get("x_username") or "",
+                    "memo": row.get("memo") or "",
+                    "preview_content": row.get("preview_content") or "",
+                    "published_at": row.get("published_at").strftime("%Y-%m-%d %H:%M") if row.get("published_at") else "",
+                    "linked_tweet_id": linked_tweet_id,
+                    "linked_tweet": linked_tweet,
+                    "candidates": candidates[:3],
+                    "match_status": match_status,
+                    "match_reason": match_reason,
+                    "match_confidence": match_confidence,
+                })
+
+            linked_count = len([item for item in posted_drafts if item["linked_tweet_id"]])
+            total["engagement_rate"] = round(total["engagements"] / total["impressions"] * 100, 2) if total["impressions"] else 0
+            return {
+                "summary": {
+                    **total,
+                    "tracked_tweets": len(tweets),
+                    "posted_drafts": len(posted_drafts),
+                    "linked_drafts": linked_count,
+                    "unlinked_drafts": max(0, len(posted_drafts) - linked_count),
+                    "auto_linked_drafts": auto_linked_count,
+                    "auto_link_threshold": AUTO_METRICS_LINK_THRESHOLD,
+                },
+                "daily": daily,
+                "tweets": tweets,
+                "top_posts": sorted(tweets, key=lambda item: item["metrics"].get("impressions") or 0, reverse=True)[:10],
+                "posted_drafts": posted_drafts,
             }
     finally:
         conn.close()
@@ -820,6 +1555,7 @@ def get_obsidian_vault_path() -> Path:
     personal_root = REPO_ROOT / "personal"
     candidates: list[Path] = [
         personal_root / _git_account_slug() / "obsidian" / "claude-obsidian",
+        personal_root / "default" / "obsidian" / "claude-obsidian",
     ]
     if personal_root.exists():
         candidates.extend(
@@ -1412,6 +2148,77 @@ def update_image_prompt_metadata(draft_id: str, prompt: str, copy_text: str = ""
     return first
 
 
+def update_draft_score_metadata(draft_id: str, score: dict) -> dict:
+    if not isinstance(score, dict):
+        raise ValueError("score はオブジェクトで指定してください")
+
+    metadata = load_draft_metadata(str(draft_id)) or {"draft_id": str(draft_id)}
+    existing_score = metadata.get("draft_score") if isinstance(metadata.get("draft_score"), dict) else {}
+    raw_score = int(float(score.get("score") or 0))
+    raw_level = str(score.get("level") or "").strip()
+    level = raw_level if raw_level in {"ok", "warn", "danger"} else (
+        "ok" if raw_score >= 82 else "warn" if raw_score >= 68 else "danger"
+    )
+    label = str(score.get("label") or ("強い" if level == "ok" else "改善余地" if level == "warn" else "弱い"))[:40]
+    criteria: list[dict] = []
+    for item in (score.get("criteria") if isinstance(score.get("criteria"), list) else [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        item_score = int(float(item.get("score") or 0))
+        item_max = int(float(item.get("max") or 20))
+        criteria.append({
+            "key": str(item.get("key") or "")[:60],
+            "label": str(item.get("label") or "")[:80],
+            "score": max(0, min(item_max, item_score)),
+            "max": max(1, min(100, item_max)),
+            "detail": str(item.get("detail") or "")[:240],
+        })
+
+    def clean_report_items(items: list, *, include_rule: bool = False) -> list[dict]:
+        cleaned: list[dict] = []
+        for index, item in enumerate(items[:12], 1):
+            if not isinstance(item, dict):
+                continue
+            clean_item = {
+                "id": str(item.get("id") or item.get("criterion_key") or f"item-{index}")[:80],
+                "criterion_key": str(item.get("criterion_key") or item.get("key") or "")[:60],
+                "title": str(item.get("title") or item.get("label") or "")[:80],
+                "score": max(0, min(100, int(float(item.get("score") or 0)))),
+                "max": max(1, min(100, int(float(item.get("max") or 20)))),
+                "detail": str(item.get("detail") or "")[:360],
+            }
+            if include_rule:
+                clean_item["rule"] = str(item.get("rule") or "")[:360]
+                clean_item["selected"] = bool(item.get("selected", True))
+            cleaned.append(clean_item)
+        return cleaned
+
+    raw_report = score.get("report") if isinstance(score.get("report"), dict) else {}
+    report = {
+        "overview": str(raw_report.get("overview") or "")[:600],
+        "strengths": clean_report_items(raw_report.get("strengths") if isinstance(raw_report.get("strengths"), list) else []),
+        "improvement_points": clean_report_items(
+            raw_report.get("improvement_points") if isinstance(raw_report.get("improvement_points"), list) else [],
+            include_rule=True,
+        ),
+    }
+
+    clean = {
+        "score": max(0, min(100, raw_score)),
+        "level": level,
+        "label": label,
+        "criteria": criteria,
+        "report": report,
+        "scored_at": str(score.get("scored_at") or datetime.now(timezone.utc).isoformat()),
+        "summary": str(score.get("summary") or f"刺さり度 {max(0, min(100, raw_score))} / {label}")[:120],
+    }
+    if isinstance(existing_score.get("applied_improvements"), list):
+        clean["applied_improvements"] = existing_score["applied_improvements"][:50]
+    metadata["draft_score"] = clean
+    save_draft_metadata(str(draft_id), metadata)
+    return clean
+
+
 def merged_character_setting(account_key: str, fallback_url: str = "") -> dict:
     setting = load_character_setting(account_key)
     reference_url = (setting.get("reference_url") or fallback_url or "").strip()
@@ -1741,6 +2548,147 @@ def append_text_rewrite_rule_to_account(draft_id: str, instruction: str, scope: 
         text = text.rstrip() + f"\n{entry}\n"
     account_path.write_text(text, encoding="utf-8")
     return account_path
+
+
+def apply_score_improvements_to_account(draft_id: str, improvements: list[dict]) -> dict:
+    draft = fetch_draft(draft_id)
+    if not draft:
+        raise RuntimeError("下書きが見つかりません")
+    account_path = find_account_info_file(draft.get("x_username") or "")
+    if not account_path:
+        raise RuntimeError(f"@{draft.get('x_username') or 'unknown'} のアカウント情報ファイルが見つかりません")
+
+    cleaned: list[dict] = []
+    for index, item in enumerate(improvements[:20], 1):
+        if not isinstance(item, dict):
+            continue
+        rule = re.sub(r"\s+", " ", str(item.get("rule") or "").strip())
+        title = re.sub(r"\s+", " ", str(item.get("title") or item.get("label") or f"改善点{index}").strip())
+        detail = re.sub(r"\s+", " ", str(item.get("detail") or "").strip())
+        if not rule:
+            continue
+        cleaned.append({
+            "id": str(item.get("id") or item.get("criterion_key") or f"improvement-{index}")[:80],
+            "criterion_key": str(item.get("criterion_key") or "")[:60],
+            "title": title[:80],
+            "score": max(0, min(100, int(float(item.get("score") or 0)))),
+            "max": max(1, min(100, int(float(item.get("max") or 20)))),
+            "detail": detail[:360],
+            "rule": rule[:360],
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if not cleaned:
+        raise ValueError("取り入れる観察メモがありません")
+
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    section = "## 採点から採用した運用改善"
+    entries = []
+    for item in cleaned:
+        entries.append(
+            f"- {now} / draft_id: {draft_id} / [{item['title']}] {item['rule']}"
+            + (f"\n  - 根拠: {item['detail']}" if item["detail"] else "")
+        )
+
+    text = account_path.read_text(encoding="utf-8") if account_path.exists() else ""
+    if section not in text:
+        text = text.rstrip() + f"\n\n{section}\n\n" + "\n".join(entries) + "\n"
+    else:
+        text = text.rstrip() + "\n" + "\n".join(entries) + "\n"
+    account_path.write_text(text, encoding="utf-8")
+
+    metadata = load_draft_metadata(str(draft_id)) or {"draft_id": str(draft_id)}
+    score = metadata.get("draft_score") if isinstance(metadata.get("draft_score"), dict) else {}
+    existing = score.get("applied_improvements") if isinstance(score.get("applied_improvements"), list) else []
+    existing_keys = {str(item.get("id") or item.get("rule") or "") for item in existing if isinstance(item, dict)}
+    merged = list(existing)
+    for item in cleaned:
+        key = str(item.get("id") or item.get("rule") or "")
+        if key not in existing_keys:
+            merged.append(item)
+            existing_keys.add(key)
+    score["applied_improvements"] = merged[-50:]
+    metadata["draft_score"] = score
+    save_draft_metadata(str(draft_id), metadata)
+    return {
+        "account_rule_path": str(account_path),
+        "applied_improvements": cleaned,
+        "draft_score": score,
+    }
+
+
+def _account_path_from_key(account_key: str = "") -> Path | None:
+    clean = (account_key or "").strip()
+    if clean and clean.lower() not in {"all", "__anonymous__"}:
+        found = find_account_info_file(clean)
+        if found:
+            return found
+    payload = _bookmarks_payload()
+    profile = payload.get("account_profile") if isinstance(payload.get("account_profile"), dict) else {}
+    for value in (profile.get("username"), profile.get("x_username"), profile.get("account_id")):
+        found = find_account_info_file(str(value or ""))
+        if found:
+            return found
+    accounts = load_accounts_config()
+    for item in accounts:
+        found = find_account_info_file(str(item.get("x_username") or item.get("id") or ""))
+        if found:
+            return found
+    return None
+
+
+def apply_source_improvements_to_account(tweet_id: str, account_key: str, improvements: list[dict]) -> dict:
+    account_path = _account_path_from_key(account_key)
+    if not account_path:
+        raise RuntimeError("反映先のアカウント情報ファイルが見つかりません")
+
+    cleaned: list[dict] = []
+    for index, item in enumerate(improvements[:20], 1):
+        if not isinstance(item, dict):
+            continue
+        rule = re.sub(r"\s+", " ", str(item.get("rule") or "").strip())
+        title = re.sub(r"\s+", " ", str(item.get("title") or f"転用ポイント{index}").strip())
+        detail = re.sub(r"\s+", " ", str(item.get("detail") or "").strip())
+        if not rule:
+            continue
+        cleaned.append({
+            "id": str(item.get("id") or f"source-point-{index}")[:80],
+            "title": title[:80],
+            "detail": detail[:360],
+            "rule": rule[:360],
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if not cleaned:
+        raise ValueError("取り入れる改善点がありません")
+
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    section = "## 元投稿分析から採用した型"
+    entries = []
+    for item in cleaned:
+        entries.append(
+            f"- {now} / source_tweet_id: {tweet_id} / [{item['title']}] {item['rule']}"
+            + (f"\n  - 根拠: {item['detail']}" if item["detail"] else "")
+        )
+    text = account_path.read_text(encoding="utf-8") if account_path.exists() else ""
+    if section not in text:
+        text = text.rstrip() + f"\n\n{section}\n\n" + "\n".join(entries) + "\n"
+    else:
+        text = text.rstrip() + "\n" + "\n".join(entries) + "\n"
+    account_path.write_text(text, encoding="utf-8")
+
+    payload = load_bookmark_state_payload()
+    applied = payload.get("source_post_applied_improvements")
+    if not isinstance(applied, dict):
+        applied = {}
+    existing = applied.get(str(tweet_id))
+    if not isinstance(existing, list):
+        existing = []
+    applied[str(tweet_id)] = [*existing, *cleaned][-80:]
+    payload["source_post_applied_improvements"] = applied
+    save_bookmark_state_payload(payload)
+    return {
+        "account_rule_path": str(account_path),
+        "applied_improvements": cleaned,
+    }
 
 
 def account_rules_for_draft(draft: dict) -> str:
@@ -4966,6 +5914,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(data if data else {"error": "見つかりません"}, 200 if data else 404)
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
+        elif path == "/api/source-posts":
+            try:
+                self.send_json(fetch_source_posts(
+                    query=qs.get("q", [""])[0].strip(),
+                    limit=int(qs.get("limit", ["100"])[0] or 100),
+                    author=qs.get("author", [""])[0].strip(),
+                    tag=qs.get("tag", [""])[0].strip(),
+                ))
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/source-post/analysis":
+            tweet_id = qs.get("tweet_id", [""])[0].strip()
+            if not tweet_id:
+                self.send_json({"error": "tweet_id パラメータが必要です"}, 400)
+                return
+            try:
+                self.send_json({"ok": True, "analysis": analyze_source_post(tweet_id)})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/analytics/dashboard":
+            try:
+                self.send_json({"ok": True, **fetch_analytics_dashboard(qs.get("account", [""])[0].strip())})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
         elif path == "/api/public-url":
             self.send_json({"url": PUBLIC_URL})
         elif path == "/api/character-settings":
@@ -5216,7 +6188,51 @@ class Handler(BaseHTTPRequestHandler):
 
         body = self.read_body()
 
-        if path == "/api/notify":
+        if path == "/api/draft/score":
+            draft_id = body.get("draft_id")
+            score = body.get("score")
+            if not draft_id or not isinstance(score, dict):
+                self.send_json({"error": "draft_id と score が必要です"}, 400)
+                return
+            try:
+                draft_score = update_draft_score_metadata(str(draft_id), score)
+                self.send_json({"ok": True, "draft_score": draft_score})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/draft/score/improvements":
+            draft_id = body.get("draft_id")
+            improvements = body.get("improvements")
+            if not draft_id or not isinstance(improvements, list):
+                self.send_json({"error": "draft_id と improvements 配列が必要です"}, 400)
+                return
+            try:
+                result = apply_score_improvements_to_account(str(draft_id), improvements)
+                self.send_json({"ok": True, **result})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/source-post/analysis/apply":
+            tweet_id = str(body.get("tweet_id") or "").strip()
+            account_key = str(body.get("account_key") or "").strip()
+            improvements = body.get("improvements")
+            if not tweet_id or not isinstance(improvements, list):
+                self.send_json({"error": "tweet_id と improvements 配列が必要です"}, 400)
+                return
+            try:
+                result = apply_source_improvements_to_account(tweet_id, account_key, improvements)
+                self.send_json({"ok": True, **result})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/draft/metrics-link":
+            draft_id = str(body.get("draft_id") or "").strip()
+            tweet_id = str(body.get("tweet_id") or "").strip()
+            if not draft_id or not tweet_id:
+                self.send_json({"error": "draft_id と tweet_id が必要です"}, 400)
+                return
+            try:
+                self.send_json({"ok": True, **link_draft_to_tweet(draft_id, tweet_id, body.get("source") or "manual")})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/api/notify":
             draft_id = body.get("draft_id")
             main_content = body.get("main_content", "")
             x_username = body.get("x_username", "")

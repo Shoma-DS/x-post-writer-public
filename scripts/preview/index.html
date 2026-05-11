@@ -25,7 +25,7 @@
           <span class="avatar-sm" id="header-account-avatar"><span class="material-symbols-rounded ui-icon" aria-hidden="true">person</span></span>
         </button>
         <button class="refresh-btn account-switch-btn" onclick="openEnvSettingsModal()" title="設定" aria-label="設定"><span class="material-symbols-rounded ui-icon" aria-hidden="true">settings</span></button>
-        <button id="refresh-btn" class="refresh-btn" onclick="loadDraftList()" title="一覧を更新" aria-label="一覧を更新"><span class="material-symbols-rounded ui-icon" aria-hidden="true">refresh</span></button>
+        <button id="refresh-btn" class="refresh-btn" onclick="refreshCurrentView()" title="一覧を更新" aria-label="一覧を更新"><span class="material-symbols-rounded ui-icon" aria-hidden="true">refresh</span></button>
       </div>
 
       <button id="account-summary" class="account-summary" onclick="openAccountModal()">
@@ -35,6 +35,12 @@
           <span id="account-summary-user">下書き全体を表示</span>
         </span>
       </button>
+
+      <div class="view-switcher" aria-label="画面切り替え">
+        <button id="view-drafts-btn" class="view-switch-btn active" onclick="setMainView('drafts')"><span class="material-symbols-rounded ui-icon" aria-hidden="true">edit_note</span>下書き</button>
+        <button id="view-sources-btn" class="view-switch-btn" onclick="setMainView('sources')"><span class="material-symbols-rounded ui-icon" aria-hidden="true">travel_explore</span>元投稿</button>
+        <button id="view-analytics-btn" class="view-switch-btn" onclick="setMainView('analytics')"><span class="material-symbols-rounded ui-icon" aria-hidden="true">query_stats</span>分析</button>
+      </div>
 
       <div class="search-wrap">
         <input

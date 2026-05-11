@@ -1,7 +1,7 @@
 # XのブックマークをAPIで取得し、初回のみアカウント情報ファイルも初期化するスクリプト。
 # 実アカウントと accounts/*.md の対応を照合し、2回目以降は既存ファイルを再利用する。
 # OAuth 2.0 アクセストークンが期限切れの場合はリフレッシュトークンで自動更新する。
-# 使い方: python fetch_bookmarks.py [--account GUTARA] [--count 5] [--refresh-account-file]
+# 使い方: python fetch_bookmarks.py [--account GUTARA] [--count 100] [--refresh-account-file]
 
 import argparse
 import json
@@ -580,27 +580,45 @@ def ensure_account_file(account_cfg, profile, refresh=False):
     }
 
 
-_THREAD_FETCH_LIMIT = 5  # 1回の実行でスレッド取得を試みる最大ブックマーク数（レート制限対策）
+_THREAD_FETCH_LIMIT = int(os.environ.get("X_BOOKMARK_THREAD_FETCH_LIMIT", "100") or 100)
 
 
-def _fetch_thread_parts(client, conversation_id: str, author_id) -> list[dict]:
+def _fetch_thread_parts(client, conversation_id: str, author_id, author_username: str = "") -> list[dict]:
     """同じ conversation_id を持つ著者ツイートを取得してスレッド順に返す。"""
     try:
         resp = client.get_users_tweets(
             id=str(author_id),
             max_results=100,
-            tweet_fields=["conversation_id", "text", "created_at"],
+            tweet_fields=["conversation_id", "text", "created_at", "public_metrics", "attachments"],
+            expansions=["attachments.media_keys"],
+            media_fields=["url", "preview_image_url", "type", "variants"],
         )
     except Exception:
         return []
     if not resp.data:
         return []
+    media_map: dict = {}
+    if resp.includes:
+        for media in (resp.includes.get("media") or []):
+            media_map[media.media_key] = media
     parts = []
-    for t in resp.data:
+    for index, t in enumerate(resp.data, 1):
         cid = str(getattr(t, "conversation_id", None) or "")
         if cid == conversation_id:
-            parts.append({"tweet_id": str(t.id), "text": t.text})
+            tweet_id = str(t.id)
+            metrics = getattr(t, "public_metrics", None) or {}
+            parts.append({
+                "tweet_id": tweet_id,
+                "position": index,
+                "text": t.text,
+                "created_at": format_dt(getattr(t, "created_at", None)),
+                "public_metrics": dict(metrics) if isinstance(metrics, dict) else {},
+                "media": _extract_media(t, media_map),
+                "tweet_url": f"https://x.com/{author_username}/status/{tweet_id}" if author_username else "",
+            })
     parts.sort(key=lambda x: int(x["tweet_id"]))  # 古い順（= スレッド上から）
+    for index, part in enumerate(parts, 1):
+        part["position"] = index
     return parts
 
 
@@ -681,7 +699,7 @@ def fetch_bookmarks(client, count, account_cfg=None, user_id=None):
         thread_parts: list[dict] = []
         if should_fetch_thread:
             print(f"  🔗 スレッド取得: @{username} (conversation_id={conv_id})")
-            thread_parts = _fetch_thread_parts(client, conv_id, tweet.author_id)
+            thread_parts = _fetch_thread_parts(client, conv_id, tweet.author_id, username)
             thread_fetch_count += 1
             if len(thread_parts) > 1:
                 print(f"     → {len(thread_parts)} パーツ取得")
@@ -697,6 +715,8 @@ def fetch_bookmarks(client, count, account_cfg=None, user_id=None):
             "text":            tweet.text,
             "author_username": username,
             "author_name":     author_name,
+            "created_at":      format_dt(getattr(tweet, "created_at", None)),
+            "public_metrics":  dict(metrics) if isinstance(metrics, dict) else {},
             "conversation_id": conv_id,
             "thread_parts":    thread_parts,
             "media":           media,
@@ -711,7 +731,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Xブックマーク取得")
     parser.add_argument("--account", default="GUTARA")
-    parser.add_argument("--count", type=int, default=5)
+    parser.add_argument("--count", type=int, default=100)
     parser.add_argument(
         "--refresh-account-file",
         action="store_true",

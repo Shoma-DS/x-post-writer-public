@@ -36,7 +36,7 @@ BOOKMARKS_FILE = SCRIPT_DIR / "bookmarks_latest.json"
 CONFIG_FILE = SCRIPT_DIR / "accounts_config.json"
 SCHEMA_FILE = SCRIPT_DIR / "draft_generation_schema.json"
 CLAUDE_SETTINGS_FILE = REPO_ROOT / ".claude" / "settings.local.json"
-DEFAULT_PREVIEW_URL = os.environ.get("X_PUBLIC_URL", "http://localhost:8765")
+DEFAULT_PREVIEW_URL = "https://your-domain.ngrok-free.dev"
 DISCORD_WEBHOOK_ENV = "DISCORD_WEBHOOK_X_DRAFT"
 TOKEN_LIMIT_PATTERNS = (
     r"token limit",
@@ -502,7 +502,7 @@ def build_generation_prompt(
 
     prompt = f"""
 あなたは X 投稿自動化ワーカーです。
-目的は、Xブックマークから対象アカウント向けのツリー型下書きを生成し、構造化JSONだけを返すことです。
+目的は、Xブックマークから「ぐーたらAI社長（@gutaraAikatuyou）」向けのツリー型下書きを生成し、構造化JSONだけを返すことです。
 
 【基本制約】
 - 出力は JSON のみ。Markdown・説明文・コードブロックは禁止。
@@ -621,10 +621,13 @@ def build_generation_prompt(
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【トーンのルール】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- accounts 配下のアカウント情報、キャラクター設定、NG事項を最優先で守る。
-- 専門用語は、読者が分かる短い補足とセットで使う。
-- 固有名詞は、知らない人向けの短い説明とセットにする。
-- アカウント固有の口調が未設定の場合は、読みやすく具体的な日本語で書く。
+- キャラ: ぐーたら・怠け者・でも結果は出ている。自己矛盾をキャラにしている。
+- 口調: カジュアル寄り。「ｗ」「〜だよね」「〜だけど」を適度に使う。断言調。
+- 参考トーン @MakeAI_CEO: 専門知識を自信を持って伝えつつ、難しい概念を初心者向けに嚙み砕く。
+- 専門用語は使った直後に必ず平易な言葉で補足する（メタファー・アナロジー必須）。
+  例: 「API＝アプリ同士の受付窓口」「ワークフロー＝作業の流れをレシピ化したもの」「AIエージェント＝作業を任せられるAIアシスタント」
+- 専門用語を避けすぎない。ChatGPT / Claude / Gemini / Cursor / Dify / n8n / API / AIエージェントなど、読者が次に検索できる固有名詞は明示する。
+- 固有名詞は「知らない人向けの短い説明」とセットにする。読み終えた人が検索する前から、おおよその価値が分かる状態にする。
 - 「正直僕もよく分かってない。笑」のような非エンジニア共感フレーズを適所で使う。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -715,10 +718,78 @@ _NG_PATTERNS = [
     (r"いいね[・＆&]リポスト", "エンゲージメント乞い"),
 ]
 
+X_FREE_ACCOUNT_UNIT_LIMIT = 280
+X_URL_WEIGHT = 23
+_X_URL_PATTERN = re.compile(r"(?:https?://|www\.)[^\s<>\"']+")
+
+
+def _is_fullwidth_codepoint(code_point: int) -> bool:
+    return (
+        0x1100 <= code_point <= 0x11FF
+        or 0x2E80 <= code_point <= 0xA4CF
+        or 0xAC00 <= code_point <= 0xD7AF
+        or 0xF900 <= code_point <= 0xFAFF
+        or 0xFE10 <= code_point <= 0xFE6F
+        or 0xFF01 <= code_point <= 0xFF60
+        or 0xFFE0 <= code_point <= 0xFFE6
+    )
+
+
+def _is_emoji_base(code_point: int) -> bool:
+    return (
+        0x1F000 <= code_point <= 0x1FAFF
+        or 0x2600 <= code_point <= 0x27BF
+    )
+
+
+def _x_text_units_without_urls(text: str) -> int:
+    units = 0
+    i = 0
+    chars = list(text)
+    while i < len(chars):
+        code_point = ord(chars[i])
+        if chars[i].isspace():
+            units += 1
+        elif _is_emoji_base(code_point):
+            units += 1
+            i += 1
+            while i < len(chars):
+                next_point = ord(chars[i])
+                if next_point in (0x200D, 0xFE0E, 0xFE0F) or 0x1F3FB <= next_point <= 0x1F3FF:
+                    i += 1
+                    continue
+                if i > 0 and ord(chars[i - 1]) == 0x200D and _is_emoji_base(next_point):
+                    i += 1
+                    continue
+                break
+            continue
+        elif _is_fullwidth_codepoint(code_point):
+            units += 2
+        else:
+            units += 1
+        i += 1
+    return units
+
+
+def x_free_account_text_units(text: str) -> int:
+    """無料X通常ポスト換算。全角=2、半角/改行/絵文字=1、URL=23。"""
+    value = str(text or "")
+    units = 0
+    cursor = 0
+    for match in _X_URL_PATTERN.finditer(value):
+        units += _x_text_units_without_urls(value[cursor:match.start()])
+        units += X_URL_WEIGHT
+        cursor = match.end()
+    units += _x_text_units_without_urls(value[cursor:])
+    return units
+
+
 def validate_draft_quality(result: dict) -> list[dict]:
-    """生成された下書きの品質チェック（スレッド・文字数・NGパターン）。"""
+    """生成された下書きの品質チェック（スレッド・NGパターン）。"""
     import re as _re
     issues: list[dict] = []
+    check_char_limit = os.environ.get("X_POST_CHECK_CHAR_LIMIT", "").lower() in {"1", "true", "yes", "on"}
+    char_limit = int(os.environ.get("X_POST_CHAR_LIMIT", str(X_FREE_ACCOUNT_UNIT_LIMIT)) or X_FREE_ACCOUNT_UNIT_LIMIT)
 
     for item in result.get("drafts", []):
         author  = item.get("author_username", "?")
@@ -731,9 +802,10 @@ def validate_draft_quality(result: dict) -> list[dict]:
             part_issues.append(f"単発({len(parts)}パーツ) — ツリー3〜4パーツ必須")
 
         for i, text in enumerate(parts, 1):
-            chars = len(text)
-            if chars > 280:
-                part_issues.append(f"P{i}: {chars}字（280字超）")
+            if check_char_limit:
+                text_units = x_free_account_text_units(text)
+                if text_units > char_limit:
+                    part_issues.append(f"P{i}: 無料X換算{text_units}/{char_limit}（全角140/半角280相当・URL=23）")
             for pattern, label in _NG_PATTERNS:
                 if _re.search(pattern, text):
                     part_issues.append(f"P{i}: NGパターン「{label}」")
@@ -746,6 +818,263 @@ def validate_draft_quality(result: dict) -> list[dict]:
             })
 
     return issues
+
+
+def _draft_texts(parts: list) -> list[str]:
+    texts: list[str] = []
+    for part in parts or []:
+        if isinstance(part, dict):
+            texts.append(str(part.get("content") or ""))
+        else:
+            texts.append(str(part or ""))
+    return texts
+
+
+def _count_matches(text: str, patterns: list[str]) -> int:
+    return sum(1 for pattern in patterns if re.search(pattern, text, re.IGNORECASE))
+
+
+def _clamp_score(value: int, max_value: int = 20) -> int:
+    return max(0, min(max_value, value))
+
+
+def _known_tool_signals(text: str) -> list[str]:
+    known = re.findall(
+        r"\b(?:ChatGPT|Claude|Codex|OpenAI|GitHub|Remotion|HyperFrames|Editframe|Threads|Instagram|Blender|Unity|Cursor|Hacker News)\b",
+        text,
+    )
+    latin_brands = re.findall(r"\b[A-Z][A-Za-z0-9]{2,}(?:[A-Z][A-Za-z0-9]+)?\b", text)
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in [*known, *latin_brands]:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result[:8]
+
+
+def _criterion_insight(item: dict) -> dict:
+    table = {
+        "hook": {
+            "good": "冒頭で疑問・数字・違和感を出せていて、スクロールを止める力があります。",
+            "improve": "1行目に「数字」「逆張り」「知らないと損」のどれかを明確に入れると、さらに止まりやすくなります。",
+            "rule": "投稿の1行目は、数字・逆張り・損失回避・原因指摘のいずれかを必ず入れ、読者が続きを見たくなる問いで始める。",
+        },
+        "target": {
+            "good": "誰に向けた話かが読み取りやすく、読者が自分ごと化しやすい構成です。",
+            "improve": "初心者・副業層・AI量産中級者のどの層に一番刺す投稿なのかを、冒頭かPart 2でより明示すると強くなります。",
+            "rule": "投稿ごとに最重要ターゲットを1つ決め、冒頭またはPart 2で「誰のどんな悩みの話か」を明示する。",
+        },
+        "painBenefit": {
+            "good": "課題と得られる変化がつながっていて、読む理由を作れています。",
+            "improve": "読者の痛みをもう一段具体化し、「それを放置すると何を損するか」まで書くと刺さりやすくなります。",
+            "rule": "本文では読者の痛み、放置した場合の損、得られる変化をセットで書く。",
+        },
+        "specificity": {
+            "good": "固有名詞・数字・比較軸があり、情報としての信頼感があります。",
+            "improve": "数字、ツール名、使う場面、比較対象をもう1つ足すと、抽象論から実用情報に寄ります。",
+            "rule": "抽象的な主張で終わらせず、数字・固有名詞・具体的な使用場面・比較対象のうち最低2つを入れる。",
+        },
+        "flow": {
+            "good": "ツリーの流れが読みやすく、次の投稿へ進む理由が作れています。",
+            "improve": "各パートの最後に短い橋渡しを入れ、重複表現を削ると最後まで読まれやすくなります。",
+            "rule": "ツリー投稿では各パート末尾に次を読みたくなる短い橋渡しを置き、同じ説明の繰り返しは削る。",
+        },
+        "action": {
+            "good": "次に見る・試す・保存するなどの行動導線があります。",
+            "improve": "最後に「保存」「試す」「比較する」など、読後にやることを1つだけ明確にすると反応が取りやすくなります。",
+            "rule": "最終パートでは読者の次アクションを1つに絞り、保存・試す・比較・リプ確認など自然な導線で締める。",
+        },
+    }
+    key = str(item.get("key") or "")
+    insight = table.get(key) or {
+        "good": f"{item.get('label') or '項目'}は一定の水準を満たしています。",
+        "improve": f"{item.get('label') or '項目'}をもう少し具体化すると投稿全体の説得力が上がります。",
+        "rule": f"{item.get('label') or '項目'}を次回以降の投稿でも具体的に確認する。",
+    }
+    max_value = int(item.get("max") or 20)
+    score = int(item.get("score") or 0)
+    return {
+        "id": key or str(item.get("label") or "criterion"),
+        "criterion_key": key,
+        "title": str(item.get("label") or "採点項目"),
+        "score": score,
+        "max": max_value,
+        "detail": insight["good"] if max_value and score / max_value >= 0.8 else insight["improve"],
+        "good": insight["good"],
+        "improvement": insight["improve"],
+        "rule": insight["rule"],
+    }
+
+
+def _build_score_report(criteria: list[dict], total_score: int) -> dict:
+    items = [_criterion_insight(item) for item in criteria]
+    strengths = sorted(
+        [item for item in items if item["max"] and item["score"] / item["max"] >= 0.8],
+        key=lambda item: item["score"] / item["max"],
+        reverse=True,
+    )[:4]
+    if not strengths:
+        strengths = sorted(items, key=lambda item: item["score"] / item["max"], reverse=True)[:2]
+    weak_items = sorted(
+        [item for item in items if item["max"] and item["score"] / item["max"] < 0.8],
+        key=lambda item: item["score"] / item["max"],
+    )
+    if not weak_items:
+        weak_items = sorted(items, key=lambda item: item["score"] / item["max"])[:3]
+    overview = (
+        "全体として投稿の引きが強く、読者が続きを読む理由も作れています。反応をさらに伸ばすなら、弱い項目だけを運用ルールへ戻すのが効率的です。"
+        if total_score >= 82
+        else "土台はできていますが、刺す対象・読後アクション・具体例のどれかを強めると反応が伸びやすい状態です。"
+        if total_score >= 68
+        else "現状は読み手の自分ごと化が弱くなりやすいので、フック・ターゲット・具体性を優先して改善したい状態です。"
+    )
+    return {
+        "overview": overview,
+        "strengths": [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "score": item["score"],
+                "max": item["max"],
+                "detail": item["good"],
+            }
+            for item in strengths
+        ],
+        "improvement_points": [
+            {
+                "id": item["id"],
+                "criterion_key": item["criterion_key"],
+                "title": item["title"],
+                "score": item["score"],
+                "max": item["max"],
+                "detail": item["improvement"],
+                "rule": item["rule"],
+                "selected": True,
+            }
+            for item in weak_items
+        ],
+    }
+
+
+def _repeated_text_signals(texts: list[str]) -> list[str]:
+    chunks: list[str] = []
+    for text in texts:
+        normalized = re.sub(r"https?://\S+", "", text)
+        for chunk in re.split(r"[！？!?。．\n]+", normalized):
+            value = chunk.strip()
+            if len(value) >= 10:
+                chunks.append(value)
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for chunk in chunks:
+        key = re.sub(r"\s+", "", chunk).lower()
+        if key in seen and chunk not in repeated:
+            repeated.append(chunk)
+        seen.add(key)
+    return repeated[:3]
+
+
+def score_draft_for_audience(parts: list, image_prompt: dict | None = None, memo: str = "") -> dict:
+    """フック・ターゲット・具体性などから、刺さり度を概算する軽量スコア。"""
+    texts = _draft_texts(parts)
+    first_text = (texts[0] if texts else "").strip()
+    full_text = "\n".join(texts)
+    normalized = re.sub(r"\s+", " ", full_text)
+    image_prompt = image_prompt or {}
+    prompt_text = " ".join(str(image_prompt.get(key) or "") for key in ("copy", "prompt"))
+    combined = " ".join(value for value in [normalized, prompt_text, memo] if value)
+    tools = _known_tool_signals(combined)
+    repeated = _repeated_text_signals(texts)
+
+    hook_hits = _count_matches(first_text, [
+        r"[？?]",
+        r"(損|危険|注意|まだ|実は|知ら|なぜ|違う|遠回り|言い訳|比較|全部|まるっと)",
+        r"(\d|万|円|%|倍|AI|API)",
+    ])
+    target_hits = _count_matches(combined, [
+        r"(AI|SNS|X|投稿|運用|インスタ|Threads|マーケ|営業|制作|開発|個人|副業|経営|フリーランス)",
+        r"(人|担当|社長|クリエイター|開発者|マーケター|店舗|チーム)",
+        r"(伸びない|時間がない|毎回|手作業|課金|コスト|探す|作る|管理)",
+    ])
+    pain_benefit_hits = _count_matches(combined, [
+        r"(損|悩|詰ま|面倒|消耗|遅い|高い|失敗|遠回り|課題|問題)",
+        r"(任せ|自動|削減|増や|伸ば|差別化|時短|勝ち|資産|ラク|効率)",
+        r"(だから|つまり|結論|要するに|ポイント|大事|先に)",
+    ])
+    specificity_patterns = [
+        r"(\d|万|円|%|倍|件|ステップ|つ|個)",
+        r"(月額|買い切り|無料|有料|URL|ツール|API|ライブラリ|フレームワーク)",
+    ]
+    if tools:
+        specificity_patterns.append("|".join(re.escape(value) for value in tools))
+    specificity_hits = _count_matches(combined, specificity_patterns)
+    action_hits = _count_matches(combined, [
+        r"(次|まず|やる|使う|試す|保存|チェック|見る|置いて|リプ|詳しく|導線)",
+        r"(ステップ|手順|方法|比較|リスト|テンプレ|URL)",
+    ])
+    flow_base = 10 if 3 <= len(texts) <= 7 else 5 if len(texts) == 1 else 8
+    flow_penalty = 4 if repeated else 0
+    density_penalty = 3 if any(len(text) > 700 for text in texts) else 0
+
+    criteria = [
+        {
+            "key": "hook",
+            "label": "フック",
+            "score": _clamp_score(8 + hook_hits * 4),
+            "max": 20,
+            "detail": "冒頭に疑問・違和感・数字があり止まりやすい" if hook_hits >= 2 else "冒頭の引っかかりをもう少し強くできる",
+        },
+        {
+            "key": "target",
+            "label": "ターゲット適合",
+            "score": _clamp_score(6 + target_hits * 4),
+            "max": 20,
+            "detail": "誰の課題かが本文から読み取りやすい" if target_hits >= 2 else "誰向けの話かをもう一段具体化したい",
+        },
+        {
+            "key": "painBenefit",
+            "label": "痛みと得",
+            "score": _clamp_score(6 + pain_benefit_hits * 4),
+            "max": 20,
+            "detail": "課題と得られる変化がつながっている" if pain_benefit_hits >= 2 else "悩みとベネフィットの接続を強めたい",
+        },
+        {
+            "key": "specificity",
+            "label": "具体性",
+            "score": _clamp_score(6 + specificity_hits * 4),
+            "max": 20,
+            "detail": f"固有名詞・数字がある: {', '.join(tools[:3])}" if tools else "数字・固有名詞・比較軸を足すと信頼感が上がる",
+        },
+        {
+            "key": "flow",
+            "label": "読み進めやすさ",
+            "score": _clamp_score(flow_base + 10 - flow_penalty - density_penalty),
+            "max": 20,
+            "detail": "重複表現が少し目立つ" if repeated else "構成は読み進めやすい範囲",
+        },
+        {
+            "key": "action",
+            "label": "行動導線",
+            "score": _clamp_score(5 + action_hits * 5),
+            "max": 20,
+            "detail": "次に何を見る/試すかの導線がある" if action_hits else "保存・確認・試すなどの次アクションが弱い",
+        },
+    ]
+    total_score = sum(int(item["score"]) for item in criteria)
+    total_max = sum(int(item["max"]) for item in criteria) or 1
+    weighted_total = round(total_score / total_max * 100)
+    level = "ok" if weighted_total >= 82 else "warn" if weighted_total >= 68 else "danger"
+    label = "強い" if weighted_total >= 82 else "改善余地" if weighted_total >= 68 else "弱い"
+    return {
+        "score": weighted_total,
+        "level": level,
+        "label": label,
+        "criteria": criteria,
+        "report": _build_score_report(criteria, weighted_total),
+        "scored_at": utc_now(),
+        "summary": f"刺さり度 {weighted_total} / {label}",
+    }
 
 
 _RESEARCH_PER_RUN = 5   # 1回の実行でリサーチするブックマークの上限（レート制限対策）
@@ -1048,6 +1377,11 @@ def persist_generation(
                             print(f"  ⚠️  元メディア保存失敗: {e}")
 
         preview_url = f"{preview_base}?draft={draft_id}"
+        draft_score = score_draft_for_audience(
+            item.get("parts") or [],
+            image_prompt=image_prompt,
+            memo=memo,
+        )
         metadata = {
             "draft_id": draft_id,
             "account_id": payload["account"],
@@ -1059,6 +1393,7 @@ def persist_generation(
             "created_at": utc_now(),
             "preview_url": preview_url,
             "rationale": item.get("rationale", ""),
+            "draft_score": draft_score,
             "image_prompts": [
                 {
                     "position": 1,
@@ -1096,6 +1431,7 @@ def persist_generation(
                 "parts": item["parts"],
                 "preview_url": preview_url,
                 "image_prompt": metadata["image_prompts"][0],
+                "draft_score": draft_score,
                 "metadata_path": str(metadata_path),
             }
         )
@@ -1160,7 +1496,7 @@ def send_discord_error(webhook_url: str, message: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Xブックマーク定時下書き生成")
     parser.add_argument("--account", default="GUTARA")
-    parser.add_argument("--count", type=int, default=20)
+    parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--codex-timeout", type=int, default=1800)
     parser.add_argument("--claude-timeout", type=int, default=1800)
     parser.add_argument("--fetch-timeout", type=int, default=120)

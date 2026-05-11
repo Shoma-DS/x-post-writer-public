@@ -21,15 +21,8 @@ CONFIG_FILE = SCRIPT_DIR / "accounts_config.json"
 REPO_ROOT   = SCRIPT_DIR.parent
 ENV_FILE    = REPO_ROOT / ".env"
 
-NGROK_DOMAIN  = os.environ.get("NGROK_DOMAIN", "").strip()
-PUBLIC_URL    = os.environ.get("X_PUBLIC_URL", "").strip()
-REDIRECT_URI  = (
-    f"https://{NGROK_DOMAIN}/oauth2/callback"
-    if NGROK_DOMAIN
-    else f"{PUBLIC_URL.rstrip('/')}/oauth2/callback"
-    if PUBLIC_URL
-    else "http://localhost:8765/oauth2/callback"
-)
+NGROK_DOMAIN  = "your-domain.ngrok-free.dev"
+REDIRECT_URI  = f"https://{NGROK_DOMAIN}/oauth2/callback"
 PREVIEW_API   = "http://localhost:8765/api/oauth2-callback"
 SCOPES        = ["bookmark.read", "tweet.read", "users.read", "offline.access"]
 POLL_INTERVAL = 2    # 秒
