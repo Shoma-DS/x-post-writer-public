@@ -1,0 +1,95 @@
+<!doctype html>
+<!--
+  Prompt Timeline is a static learning site for reviewing agent prompts,
+  work summaries, and follow-up actions recorded in this repository.
+-->
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prompt Timeline</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#summary">本文へ移動</a>
+  <header class="hero" id="top">
+    <div class="hero-inner">
+      <p class="eyebrow" id="repoLabel">Agent prompt history</p>
+      <h1>プロンプト指示・作業要約タイムライン</h1>
+      <p class="lead">ユーザーの原文プロンプト、作業後の要約、検証や変更ファイルを、あとから学べる形で時系列に整理します。</p>
+      <div class="hero-stats" aria-label="文書サマリー">
+        <div><strong id="statTotal">0</strong><span>履歴項目</span></div>
+        <div><strong id="statSummarized">0</strong><span>要約済み</span></div>
+        <div><strong id="statFirst">-</strong><span>開始</span></div>
+        <div><strong id="statLatest">-</strong><span>最新</span></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="side-nav" aria-label="ページ内目次">
+      <div class="nav-card">
+        <a href="#summary">概要</a>
+        <a href="#phases">フェーズ</a>
+        <a href="#timeline">時系列</a>
+        <a href="#source-note">調査範囲</a>
+      </div>
+      <div class="toc-card">
+        <h2>時系列ジャンプ</h2>
+        <div id="tocList"></div>
+      </div>
+    </aside>
+
+    <div class="content">
+      <section class="toolbar" aria-label="検索と絞り込み">
+        <label class="search-box">
+          <span>検索</span>
+          <input id="searchInput" type="search" placeholder="原文、要約、アクションを検索">
+        </label>
+        <div class="segmented" role="group" aria-label="要約状態">
+          <button class="segment is-active" type="button" data-filter="all">すべて</button>
+          <button class="segment" type="button" data-filter="summarized">要約あり</button>
+          <button class="segment" type="button" data-filter="open">要約待ち</button>
+        </div>
+        <a class="download-link" href="./data/events.jsonl" download>JSONL</a>
+      </section>
+
+      <section class="summary-grid" id="summary" aria-labelledby="summary-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Executive Summary</p>
+          <h2 id="summary-heading">何が積み上がっているか</h2>
+        </div>
+        <article class="summary-card accent-orange"><h3>原文を残す</h3><p>指示の言い回し、前提、追加依頼をそのまま保持し、後からプロンプトの改善材料にできます。</p></article>
+        <article class="summary-card accent-teal"><h3>作業を要約する</h3><p>実際に何を変更し、何を検証したかを短く並べ、依頼と成果の対応を追えるようにします。</p></article>
+        <article class="summary-card accent-amber"><h3>未要約を見つける</h3><p>要約待ちだけを絞り込み、作業後に記録すべき項目を漏れなく確認できます。</p></article>
+        <article class="summary-card accent-blue"><h3>repoごとに育つ</h3><p>各リポジトリの `prompt-timeline/data/events.jsonl` を正本として、そのrepo固有の履歴サイトになります。</p></article>
+      </section>
+
+      <section class="phase-band" id="phases" aria-labelledby="phase-heading">
+        <div class="section-heading"><p class="eyebrow">Phases</p><h2 id="phase-heading">時系列の区切り</h2></div>
+        <div class="phase-list" id="phaseList"></div>
+      </section>
+
+      <section class="category-strip" aria-label="主要カテゴリ" id="categoryStrip"></section>
+
+      <section class="timeline" id="timeline" aria-labelledby="timeline-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Detailed Timeline</p>
+          <h2 id="timeline-heading">時系列の詳細</h2>
+          <p id="resultCount">0件</p>
+        </div>
+        <div id="timelineList"></div>
+      </section>
+
+      <section class="note-card" id="source-note" aria-labelledby="source-heading">
+        <p class="eyebrow">Source Note</p>
+        <h2 id="source-heading">このページの更新方法</h2>
+        <p>hook がユーザー指示を `prompt-timeline/data/events.jsonl` に追記し、`record_event.py --rebuild` が表示用 `assets/events.js` を生成します。作業後の要約は `agent-prompt-timeline` Skill で追記します。</p>
+      </section>
+    </div>
+  </main>
+
+  <script src="./assets/events.js"></script>
+  <script src="./assets/app.js"></script>
+</body>
+</html>
