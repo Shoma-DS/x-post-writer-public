@@ -1,4 +1,0 @@
-interface:
-  display_name: "Agent Prompt Timeline"
-  short_description: "Track prompts and work summaries."
-  default_prompt: "Use agent-prompt-timeline to record the current prompt and summarize what was done."
