@@ -28,6 +28,12 @@ def event_text(event: dict) -> str:
 def removal_reason(event: dict) -> str:
     if event.get("kind") != "prompt":
         return ""
+    cwd = str((event.get("meta") or {}).get("cwd") or "").strip()
+    if cwd:
+        try:
+            pathlib.Path(cwd).resolve().relative_to(record_event.REPO_ROOT)
+        except ValueError:
+            return "outside_repo"
     text = event_text(event)
     prompt = str(event.get("prompt_original") or event.get("prompt_preview") or "").strip()
     if import_history.should_skip(prompt):
