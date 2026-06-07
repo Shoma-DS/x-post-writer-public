@@ -6,6 +6,7 @@
 (function () {
   const state = {
     events: Array.isArray(window.PROMPT_TIMELINE_EVENTS) ? window.PROMPT_TIMELINE_EVENTS : [],
+    site: window.PROMPT_TIMELINE_SITE && typeof window.PROMPT_TIMELINE_SITE === "object" ? window.PROMPT_TIMELINE_SITE : {},
     filter: "all",
     query: "",
     visibleLimit: 120,
@@ -18,6 +19,7 @@
 
   const nodes = {
     repoLabel: document.querySelector("#repoLabel"),
+    publicUrl: document.querySelector("#publicUrl"),
     statTotal: document.querySelector("#statTotal"),
     statSummarized: document.querySelector("#statSummarized"),
     statFirst: document.querySelector("#statFirst"),
@@ -174,6 +176,7 @@
   }
 
   function deriveRepoLabel(prompts) {
+    if (state.site.repo_name) return `${state.site.repo_name} / prompt history`;
     const cwd = prompts.map((item) => item.meta && item.meta.cwd).find(Boolean);
     if (!cwd) return "Agent prompt history";
     const parts = String(cwd).split("/").filter(Boolean);
@@ -198,6 +201,10 @@
   function renderStats(allPrompts, prompts) {
     const summarized = allPrompts.filter((item) => item.summary || item.actions.length);
     nodes.repoLabel.textContent = deriveRepoLabel(allPrompts);
+    const publicUrl = String(state.site.vercel_url || "").trim();
+    nodes.publicUrl.innerHTML = publicUrl
+      ? `公開URL: <a href="${escapeHtml(publicUrl)}">${escapeHtml(publicUrl)}</a>`
+      : "公開URL: 未設定";
     nodes.statTotal.textContent = String(allPrompts.length);
     nodes.statSummarized.textContent = String(summarized.length);
     nodes.statFirst.textContent = allPrompts[0] ? formatDate(allPrompts[0].timestamp, "day") : "-";

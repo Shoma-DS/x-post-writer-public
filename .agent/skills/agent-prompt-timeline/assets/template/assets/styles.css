@@ -132,6 +132,27 @@ h1 {
   text-wrap: pretty;
 }
 
+.public-url {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 34px;
+  align-items: center;
+  margin: 18px 0 0;
+  border: 1px solid rgba(29, 140, 135, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--teal);
+  font-size: 0.9rem;
+  font-weight: 900;
+  padding: 4px 12px;
+}
+
+.public-url a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: inherit;
+}
+
 .hero-stats {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

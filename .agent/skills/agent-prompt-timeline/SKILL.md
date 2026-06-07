@@ -62,6 +62,30 @@ The installer copies:
 
 It preserves `prompt-timeline/data/events.jsonl` if it already exists and does not edit `.gitignore`.
 
+## Repository-specific public URL
+
+Each repository must have its own prompt timeline Vercel URL. Do not reuse one
+repository's prompt timeline URL as the canonical URL for another repository.
+
+Store the canonical URL in:
+
+```text
+prompt-timeline/data/site.json
+```
+
+Minimum shape:
+
+```json
+{
+  "repo_name": "team-info",
+  "vercel_url": "https://prompt-timeline.vercel.app"
+}
+```
+
+When installing into another repository, create `site.json` if it is missing.
+After publishing that repository's timeline on Vercel, update `vercel_url` with
+the verified production URL and rebuild the static site snapshot.
+
 ## Publish on Vercel
 
 For a static deployment:

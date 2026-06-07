@@ -19,6 +19,7 @@ SKILL_NAME = "agent-prompt-timeline"
 HOOK_EVENT = "UserPromptSubmit"
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = SKILL_DIR / "assets" / "template"
+STALE_COPY_SUFFIXES = (" 2", " 3", " 4", " copy")
 
 
 def is_repo(path: pathlib.Path) -> bool:
@@ -52,6 +53,21 @@ def copy_tree_contents(src: pathlib.Path, dst: pathlib.Path, overwrite: bool = T
             shutil.copy2(item, target)
 
 
+def remove_numbered_stale_copies(root: pathlib.Path) -> None:
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.name == "data":
+            continue
+        stem = path.stem
+        if not any(stem.endswith(suffix) for suffix in STALE_COPY_SUFFIXES):
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
 def install_site(repo: pathlib.Path) -> None:
     target = repo / "prompt-timeline"
     target.mkdir(parents=True, exist_ok=True)
@@ -63,17 +79,20 @@ def install_site(repo: pathlib.Path) -> None:
         elif stale.exists():
             stale.unlink()
     copy_tree_contents(TEMPLATE_DIR, target, overwrite=True)
+    remove_numbered_stale_copies(target)
     data_dir = target / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     events_jsonl = data_dir / "events.jsonl"
     if not events_jsonl.exists():
         events_jsonl.write_text("", encoding="utf-8")
+    ensure_site_metadata(repo)
     record_script = repo / ".agent" / "skills" / SKILL_NAME / "scripts" / "record_event.py"
     if record_script.exists():
         env = os.environ.copy()
         env["TEAM_INFO_ROOT"] = str(repo)
         env["CLAUDE_PROJECT_DIR"] = str(repo)
         env["CODEX_PROJECT_DIR"] = str(repo)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         subprocess.run([sys.executable, str(record_script), "--rebuild"], cwd=str(repo), env=env, check=False)
     sanitize_script = repo / ".agent" / "skills" / SKILL_NAME / "scripts" / "sanitize_public_events.py"
     if sanitize_script.exists():
@@ -81,7 +100,30 @@ def install_site(repo: pathlib.Path) -> None:
         env["TEAM_INFO_ROOT"] = str(repo)
         env["CLAUDE_PROJECT_DIR"] = str(repo)
         env["CODEX_PROJECT_DIR"] = str(repo)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         subprocess.run([sys.executable, str(sanitize_script)], cwd=str(repo), env=env, check=False)
+
+
+def ensure_site_metadata(repo: pathlib.Path) -> None:
+    data_path = repo / "prompt-timeline" / "data" / "site.json"
+    assets_path = repo / "prompt-timeline" / "assets" / "site.js"
+    payload = {}
+    if data_path.exists():
+        try:
+            loaded = json.loads(data_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            payload = {}
+    payload.setdefault("repo_name", repo.name)
+    payload.setdefault("vercel_url", "")
+    data_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assets_path.parent.mkdir(parents=True, exist_ok=True)
+    assets_path.write_text(
+        "/** Repository-specific prompt timeline metadata. */\n"
+        f"window.PROMPT_TIMELINE_SITE = {json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)};\n",
+        encoding="utf-8",
+    )
 
 
 def install_skill(repo: pathlib.Path) -> None:
@@ -90,6 +132,7 @@ def install_skill(repo: pathlib.Path) -> None:
         return
     target_skill.mkdir(parents=True, exist_ok=True)
     copy_tree_contents(SKILL_DIR, target_skill, overwrite=True)
+    remove_numbered_stale_copies(target_skill)
 
 
 def hook_command(source: str) -> str:
