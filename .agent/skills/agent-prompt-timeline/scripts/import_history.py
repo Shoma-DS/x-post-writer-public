@@ -78,6 +78,8 @@ BUSINESS_SENSITIVE_PATTERNS = (
 )
 
 TERMINAL_NOISE_PATTERNS = (
+    re.compile(r"https://accounts\.google\.com/o/oauth2/auth", re.IGNORECASE),
+    re.compile(r"\.apps\.googleusercontent\.com", re.IGNORECASE),
     re.compile(r"^\[[^\]\n]+:[^\]\n]+\]\s+~?/"),
     re.compile(r"^\([^)]+\)\s*\n?\[[^\]\n]+:[^\]\n]+\]"),
     re.compile(r"^(?:[A-Za-z_][\w-]*:\s*)?error:\s", re.IGNORECASE),

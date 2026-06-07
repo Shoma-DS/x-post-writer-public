@@ -74,6 +74,8 @@ def install_site(repo: pathlib.Path) -> None:
     for stale in target.iterdir():
         if stale.name == "data":
             continue
+        if stale.name == ".gitignore":
+            continue
         if stale.is_dir():
             shutil.rmtree(stale)
         elif stale.exists():

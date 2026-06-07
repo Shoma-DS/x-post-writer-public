@@ -30,6 +30,8 @@ def removal_reason(event: dict) -> str:
         return ""
     text = event_text(event)
     prompt = str(event.get("prompt_original") or event.get("prompt_preview") or "").strip()
+    if import_history.should_skip(prompt):
+        return "internal_or_noise"
     if any(pattern.search(text) for pattern in import_history.PERSONAL_PATTERNS):
         return "personal"
     if any(pattern.search(text) for pattern in import_history.BUSINESS_SENSITIVE_PATTERNS):
