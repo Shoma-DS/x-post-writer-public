@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "headroom": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-lc",
+        "[ -f \"$HOME/.headroom/lib/libonnxruntime.dylib\" ] && export ORT_DYLIB_PATH=\"$HOME/.headroom/lib/libonnxruntime.dylib\"; exec headroom mcp serve"
+      ],
+      "env": {
+        "HEADROOM_TELEMETRY": "off"
+      }
+    }
+  }
+}
